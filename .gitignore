@@ -1,0 +1,33 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+dist/
+.venv/
+venv/
+
+# 环境变量（含密码）
+.env
+
+# 前端
+node_modules/
+frontend/build/
+picture_bed/build/
+
+# IDE
+.vscode/
+.idea/
+
+# 系统
+.DS_Store
+Thumbs.db
+
+# Docker
+docker/nginx/ssl/
+
+# 旧 C 项目产物（保留不动）
+bin_cgi/
+*.o
+logs/
+*.log
+docker/nginx_fastdfs/front/
