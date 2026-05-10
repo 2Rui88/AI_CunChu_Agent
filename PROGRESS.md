@@ -12,9 +12,9 @@
 | 新建 .env 环境变量 | `docker/.env` | ✅ |
 | 新建 nginx Dockerfile | `docker/nginx/Dockerfile` | ✅ |
 | 新建 nginx.conf | `docker/nginx/nginx.conf` | ✅ |
-| 新建 mysql init.sql（复用旧版） | `docker/mysql/init.sql` | ⬜ |
-| 新建后端 Dockerfile | `backend/Dockerfile` | ⬜ |
-| 新建后端 requirements.txt | `backend/requirements.txt` | ⬜ |
+| 新建 mysql init.sql（复用旧版） | `docker/mysql/init.sql` | ✅ |
+| 新建后端 Dockerfile | `backend/Dockerfile` | ✅ |
+| 新建后端 requirements.txt | `backend/requirements.txt` | ✅ |
 | 新建后端 config.py | `backend/app/config.py` | ⬜ |
 | 新建后端 main.py（空壳 + health 端点） | `backend/app/main.py` | ⬜ |
 | 生成 SSL 自签名证书 | `docker/nginx/ssl/` | ⬜ |
