@@ -29,7 +29,7 @@
 | 数据库连接引擎 | `backend/app/database.py` | ✅ |
 | Redis 客户端 | `backend/app/redis_client.py` | ✅ |
 | ORM 模型定义（7 张表） | `backend/app/models.py` | ✅ |
-| 验证：增删改查测试通过 | — | ⬜ |
+| 验证：增删改查测试通过 | — | ✅ |
 
 ---
 
