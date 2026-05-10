@@ -17,7 +17,9 @@ engine = create_async_engine(
 
 Session = async_sessionmaker(engine, expire_on_commit=False)
 
-
+#这个函数用于将python的类和数据库中的表进行映射，创建表结构
+#这种映射是通过orm来实现的，orm框架会自动收集所有继承了Base的类，
+#并根据这些类的定义来创建数据库表结构
 async def init_db():
     async with engine.begin() as conn:
         await conn.run_sync(Base.metadata.create_all)
