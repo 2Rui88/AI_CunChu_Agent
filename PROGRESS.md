@@ -15,9 +15,9 @@
 | 新建 mysql init.sql（复用旧版） | `docker/mysql/init.sql` | ✅ |
 | 新建后端 Dockerfile | `backend/Dockerfile` | ✅ |
 | 新建后端 requirements.txt | `backend/requirements.txt` | ✅ |
-| 新建后端 config.py | `backend/app/config.py` | ⬜ |
-| 新建后端 main.py（空壳 + health 端点） | `backend/app/main.py` | ⬜ |
-| 生成 SSL 自签名证书 | `docker/nginx/ssl/` | ⬜ |
+| 新建后端 config.py | `backend/app/config.py` | ✅ |
+| 新建后端 main.py（空壳 + health 端点） | `backend/app/main.py` | ✅ |
+| 生成 SSL 自签名证书 | `docker/nginx/ssl/` | ✅ |
 | docker compose up 全容器健康 | — | ⬜ |
 
 ---
