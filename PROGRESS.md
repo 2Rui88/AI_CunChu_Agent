@@ -48,9 +48,9 @@
 
 | 项 | 文件 | 状态 |
 |----|------|------|
-| MinIO 客户端封装 | `backend/app/minio_client.py` | ⬜ |
-| 秒传检测 `/api/md5` | `backend/app/routers/files.py` | ⬜ |
-| 普通上传 `/api/upload` | `backend/app/routers/files.py` | ⬜ |
+| MinIO 客户端封装 | `backend/app/minio_client.py` | ✅ |
+| 秒传检测 `/api/md5` | `backend/app/routers/files.py` | ✅ |
+| 普通上传 `/api/upload` | `backend/app/routers/files.py` | ✅ |
 | 文件列表 `/api/myfiles` | `backend/app/routers/files.py` | ⬜ |
 | 分片初始化 `/api/chunk_init` | `backend/app/routers/chunk.py` | ⬜ |
 | 分片上传 `/api/chunk_upload` | `backend/app/routers/chunk.py` | ⬜ |
