@@ -63,9 +63,9 @@
 
 | 项 | 文件 | 状态 |
 |----|------|------|
-| 分享/删除/PV `/api/dealfile` | `backend/app/routers/share.py` | ⬜ |
-| 共享广场 `/api/sharefiles` | `backend/app/routers/share.py` | ⬜ |
-| 转存/取消分享 `/api/dealsharefile` | `backend/app/routers/share.py` | ⬜ |
+| 分享/删除/PV `/api/dealfile` | `backend/app/routers/share.py` | ✅ |
+| 共享广场 `/api/sharefiles` | `backend/app/routers/share.py` | ✅ |
+| 转存/取消分享 `/api/dealsharefile` | `backend/app/routers/share.py` | ✅ |
 | 图床分享 `/api/sharepic` | `backend/app/routers/share.py` | ⬜ |
 | 验证：分享→广场可见→转存→删除→引用计数正确 | — | ⬜ |
 
