@@ -111,3 +111,43 @@ async def upload(
         await db.commit()
 
     return {"code": 0}
+
+
+@router.post("/myfiles")
+async def myfiles(body: dict):
+    """用户文件列表查询"""
+    user = body.get("user", "")
+    token = body.get("token", "")
+    if not await check_token(user, token):
+        return {"code": 4}
+
+    cmd = body.get("cmd", "normal")
+    if cmd != "normal":
+        return {"code": 1}
+
+    start = body.get("start", 0)
+    count = body.get("count", 20)
+
+    async with Session() as db:
+        result = await db.execute(
+            select(UserFileList, FileInfo)
+            .join(FileInfo, UserFileList.md5 == FileInfo.md5)
+            .where(UserFileList.user == user)
+            .order_by(UserFileList.create_time.desc())
+            .offset(start)
+            .limit(count)
+        )
+        rows = result.all()
+        files = []
+        for ufl, fi in rows:
+            files.append({
+                "md5": ufl.md5,
+                "file_name": ufl.file_name,
+                "url": fi.url,
+                "size": fi.size,
+                "type": fi.type,
+                "pv": ufl.pv,
+                "shared_status": ufl.shared_status,
+                "create_time": str(ufl.create_time),
+            })
+        return {"code": 0, "files": files}
