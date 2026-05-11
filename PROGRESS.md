@@ -37,8 +37,8 @@
 
 | 项 | 文件 | 状态 |
 |----|------|------|
-| 注册接口 `/api/reg` | `backend/app/routers/auth.py` | ⬜ |
-| 登录接口 `/api/login` | `backend/app/routers/auth.py` | ⬜ |
+| 注册接口 `/api/reg` | `backend/app/routers/auth.py` | ✅ |
+| 登录接口 `/api/login` | `backend/app/routers/auth.py` | ✅ |
 | Token 工具函数 `check_token()` | `backend/app/dependencies.py` | ⬜ |
 | 验证：注册 → 登录 → 拿 Token → 其他接口返回 200 | — | ⬜ |
 
