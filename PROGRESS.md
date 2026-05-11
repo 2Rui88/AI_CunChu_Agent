@@ -55,7 +55,7 @@
 | 分片初始化 `/api/chunk_init` | `backend/app/routers/chunk.py` | ✅ |
 | 分片上传 `/api/chunk_upload` | `backend/app/routers/chunk.py` | ✅ |
 | 分片合并 `/api/chunk_merge` | `backend/app/routers/chunk.py` | ✅ |
-| 验证：上传 → 列表可见 → 下载正常 → 秒传生效 | — | ⬜ |
+| 验证：上传 → 列表可见 → 下载正常 → 秒传生效 | — | ✅ |
 
 ---
 
