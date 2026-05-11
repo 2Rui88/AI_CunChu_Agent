@@ -25,7 +25,7 @@ class LoginRequest(BaseModel):
 
 def _make_hash(pwd_md5: str, salt: str) -> str:
     return hashlib.md5((salt + pwd_md5).encode()).hexdigest()
-
+#原密码+slat后进行encode转为字节流，再进行md5加密，最后转为16进制字符串
 
 @router.post("/reg")
 async def register(body: RegRequest):
