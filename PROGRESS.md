@@ -76,7 +76,7 @@
 | 项 | 文件 | 状态 |
 |----|------|------|
 | DashScope API 封装 | `backend/app/dashscope_client.py` | ✅ |
-| FAISS 向量索引封装 | `backend/app/faiss_service.py` | ⬜ |
+| FAISS 向量索引封装 | `backend/app/faiss_service.py` | ✅ |
 | AI 搜索 `/api/ai/search` | `backend/app/routers/ai.py` | ⬜ |
 | AI 描述生成 `/api/ai/describe` | `backend/app/routers/ai.py` | ⬜ |
 | 索引重建 `/api/ai/rebuild` | `backend/app/routers/ai.py` | ⬜ |
