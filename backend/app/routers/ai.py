@@ -2,10 +2,18 @@
 AI 智能检索模块 —— describe / search / rebuild
 
 describe: 生成文件 AI 描述 + 向量 → 存入 MySQL + FAISS
+  - 图片(png/jpg/...) → Qwen-VL 多模态描述
+  - 文本(txt/md/py/...) → 下载读取内容作为描述
+  - docx → 解压提取 XML 文本作为描述
+  - 其他 → 类型 + 文件名拼接描述
 search:   自然语言查询 → embedding → FAISS 检索 → 回查 MySQL 返回结果
 rebuild:  从 MySQL 全量重建用户 FAISS 索引
 """
+import io
+import re
+import zipfile
 import numpy as np
+import httpx
 from fastapi import APIRouter
 from sqlalchemy import select
 from app.database import Session
@@ -19,7 +27,7 @@ from app.faiss_service import (
     rebuild_from_db,
     l2_normalize,
     get_ntotal,
-    load_index, save_index,
+    load_index,
 )
 
 router = APIRouter(prefix="/api", tags=["ai"])
@@ -134,10 +142,17 @@ async def ai_describe(body: dict):
 
 
 async def _generate_description(db, md5_val: str, filename: str, file_type: str, api_key: str) -> str:
-    """按文件类型生成中文描述：图片 → Qwen-VL，其他 → 文件名+类型"""
-    image_types = {"png", "jpg", "jpeg", "gif", "bmp", "webp", "svg"}
+    """
+    按文件类型生成中文描述：
+      - 图片 → Qwen-VL 多模态描述
+      - 文本类 → 下载后读取文本内容
+      - docx → 解压提取 word/document.xml 中的文本
+      - 其他 → 类型 + 文件名拼接
+    """
+    ft = file_type.lower()
 
-    if file_type.lower() in image_types:
+    # ── 图片：Qwen-VL 多模态描述 ──
+    if ft in _IMAGE_TYPES:
         result = await db.execute(
             select(FileInfo).where(FileInfo.md5 == md5_val).limit(1)
         )
@@ -146,8 +161,111 @@ async def _generate_description(db, md5_val: str, filename: str, file_type: str,
             public_url = _build_public_url(fi.url)
             desc = await describe_image(api_key, public_url)
             return desc
+        return f"图片文件：{filename}"
 
+    # ── 文本类 / docx：下载文件提取内容 ──
+    if ft in _TEXT_TYPES or ft == "docx":
+        result = await db.execute(
+            select(FileInfo).where(FileInfo.md5 == md5_val).limit(1)
+        )
+        fi = result.scalar()
+        if fi and fi.url:
+            internal_url = _build_internal_url(fi.url)
+            content = await _download_and_extract(internal_url, ft)
+            if content:
+                return _format_text_description(filename, content)
+
+    # ── 其他：类型 + 文件名 ──
     return f"{file_type or '未知'}类型的文件：{filename}"
+
+
+# ── 支持的文件类型 ──
+
+_IMAGE_TYPES = {"png", "jpg", "jpeg", "gif", "bmp", "webp", "svg"}
+
+_TEXT_TYPES = {
+    "txt", "md", "csv", "json", "xml", "html", "htm",
+    "log", "c", "cpp", "h", "py", "js", "css", "java",
+}
+
+
+async def _download_and_extract(file_url: str, file_type: str) -> str | None:
+    """
+    下载文件并提取文本内容。
+    - 普通文本文件 → 直接读取（最多 8192 字节）
+    - docx → 解压 ZIP 后解析 word/document.xml 中的 <w:t> 标签
+    """
+    try:
+        async with httpx.AsyncClient(timeout=30) as client:
+            resp = await client.get(file_url)
+            if resp.status_code != 200:
+                return None
+            data = resp.content
+    except Exception:
+        return None
+
+    if file_type == "docx":
+        return _parse_docx(data)
+
+    # 普通文本：直接解码（尝试 utf-8，失败则 latin-1）
+    return _decode_text(data)
+
+
+def _parse_docx(data: bytes) -> str | None:
+    """
+    解压 docx（ZIP 格式），从 word/document.xml 中提取 <w:t> 标签内的文本。
+    <w:t> 匹配规则：标签名以 w:t 开头，后面是 > 或空格（排除 <w:tab> 等）。
+    """
+    try:
+        with zipfile.ZipFile(io.BytesIO(data)) as zf:
+            xml_bytes = zf.read("word/document.xml")
+    except Exception:
+        return None
+
+    xml_text = _decode_text(xml_bytes)
+    if not xml_text:
+        return None
+
+    # 提取所有 <w:t>...</w:t> 标签中的文本内容
+    parts = re.findall(r"<w:t[ >][^>]*>(.*?)</w:t>", xml_text)
+    text = "".join(parts).strip()
+    return text if text else None
+
+
+def _decode_text(data: bytes) -> str | None:
+    """尝试 UTF-8 解码，失败则用 latin-1 兜底"""
+    try:
+        return data.decode("utf-8")
+    except UnicodeDecodeError:
+        try:
+            return data.decode("latin-1")
+        except Exception:
+            return None
+
+
+def _format_text_description(filename: str, content: str) -> str:
+    """格式化文本/文档描述：文件名 + 内容（截断到 3000 字符）"""
+    desc_len = min(len(content), 3000)
+    return f"文件名：{filename}\n文件内容：{content[:desc_len]}"
+
+
+def _build_internal_url(db_url: str) -> str:
+    """
+    构造 Docker 内网可访问的文件下载 URL（用于后端下载文本/docx 文件）。
+    直接连 MinIO 获取文件（不走 Nginx 避免 HTTPS 重定向）。
+    db_url 格式: /files/{bucket}/{object_name}
+    """
+    path_part = db_url
+    # 去掉 /files/{bucket}/ 前缀，得到 MinIO object name
+    if path_part.startswith("/files/"):
+        # /files/files/ab/cd/name.txt → ab/cd/name.txt
+        parts = path_part.split("/", 3)  # ['', 'files', 'files', 'ab/cd/name.txt']
+        if len(parts) >= 4:
+            path_part = "/" + parts[3]
+
+    return (
+        f"http://{settings.minio_endpoint}/{settings.minio_bucket}{path_part}"
+    )
 
 
 async def _copy_cache_to_user(db, user: str, md5_val: str, cache) -> dict:
