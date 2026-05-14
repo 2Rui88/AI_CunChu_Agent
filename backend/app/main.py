@@ -1,7 +1,7 @@
 from contextlib import asynccontextmanager
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
-from app.routers import auth, files, chunk, share
+from app.routers import auth, files, chunk, share, ai
 
 
 @asynccontextmanager
@@ -23,6 +23,7 @@ app.include_router(auth.router)
 app.include_router(files.router)
 app.include_router(chunk.router)
 app.include_router(share.router)
+app.include_router(ai.router)
 
 
 @app.get("/api/health")

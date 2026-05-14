@@ -38,6 +38,12 @@ class Settings(BaseSettings):
         "包括主要物体、场景、颜色、文字等信息。"
     )
 
+    # ── 服务器地址（供 DashScope 回调下载图片）──
+    web_server_ip: str = "172.30.0.3"    # 内网 Web 服务器 IP（Docker 网络内）
+    web_server_port: str = "80"           # 内网 Web 服务器端口
+    public_server_ip: str = ""            # 公网 IP（DashScope 可访问，部署时填写）
+    public_server_port: str = "8080"      # 公网端口（如使用 Nginx 反向代理则为 443）
+
     # ── FAISS ──
     faiss_user_index_dir: str = "/data/faiss/users"
 
