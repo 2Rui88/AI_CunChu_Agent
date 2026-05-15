@@ -93,7 +93,7 @@
 | 确认接口 `/api/agent/confirm` | `backend/app/routers/agent.py` | ✅ |
 | 对话记忆（Redis） | `backend/app/routers/agent.py` 集成 | ✅ |
 | 危险操作确认机制 | `backend/app/routers/agent.py` | ✅ |
-| 验证：对话→搜索→分享确认→执行成功 | — | ⬜ |
+| 验证：对话→搜索→分享确认→执行成功 | — | ✅ |
 
 ---
 
