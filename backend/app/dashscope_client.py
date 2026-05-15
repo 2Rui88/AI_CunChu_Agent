@@ -2,10 +2,12 @@
 DashScope API 封装 —— 阿里百炼模型调用
 
 三个能力:
-  1. describe_image  —— Qwen-VL 图片描述（多模态生成 API）
-  2. get_embedding   —— text-embedding-v3 文本向量化
-  3. create_client   —— 返回 OpenAI 兼容客户端（供 Agent 聊天用）
+  1. describe_image  —— 图片描述（原生多模态生成 API）
+  2. get_embedding   —— 文本向量化（原生 text-embedding API）
+  3. create_client   —— 返回 OpenAI 兼容客户端（供 Agent chat 用）
 
+describe_image 和 get_embedding 使用 DashScope 原生 API（httpx 直调），
+create_client 使用 OpenAI 兼容端点（/compatible-mode/v1）。
 所有可配置参数统一由 config.Settings 管理，不在此模块硬编码。
 """
 import httpx
@@ -60,13 +62,34 @@ async def describe_image(api_key: str, image_url: str) -> str:
 
 async def get_embedding(api_key: str, text: str) -> list[float]:
     """
-    调用 text-embedding-v3 将文本转为浮点向量，维度由 settings.embedding_dimension 决定。
-    使用 OpenAI 兼容端点。
+    调用 DashScope 原生文本向量化 API，将文本转为浮点向量。
+    使用 httpx 直调原生接口（不走 OpenAI 兼容端点），支持所有原生模型名。
+    向量维度由 settings.embedding_dimension 决定。
     """
-    client = create_client(api_key)
-    resp = await client.embeddings.create(
-        model=settings.embedding_model,
-        input=text,
-        dimensions=settings.embedding_dimension,
-    )
-    return resp.data[0].embedding
+    body = {
+        "model": settings.embedding_model,
+        "input": {
+            "texts": [text],
+        },
+        "parameters": {},
+    }
+    # 部分模型支持自定义维度，不支持的会自动忽略
+    if settings.embedding_dimension:
+        body["parameters"]["dimension"] = settings.embedding_dimension
+
+    async with httpx.AsyncClient(timeout=30) as client:
+        resp = await client.post(
+            settings.dashscope_emb_url,
+            json=body,
+            headers={
+                "Authorization": f"Bearer {api_key}",
+                "Content-Type": "application/json",
+            },
+        )
+        data = resp.json()
+
+    # 响应路径: output.embeddings[0].embedding
+    try:
+        return data["output"]["embeddings"][0]["embedding"]
+    except (KeyError, IndexError, TypeError):
+        return []

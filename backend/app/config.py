@@ -21,10 +21,14 @@ class Settings(BaseSettings):
 
     # ── DashScope ──
     dashscope_api_base: str = "https://dashscope.aliyuncs.com/compatible-mode/v1"
-    # 多模态生成（Qwen-VL 图片描述）
+    # 原生 API 端点（不走 OpenAI 兼容接口）
     dashscope_vl_url: str = (
         "https://dashscope.aliyuncs.com/api/v1/services/"
         "aigc/multimodal-generation/generation"
+    )
+    dashscope_emb_url: str = (
+        "https://dashscope.aliyuncs.com/api/v1/services/"
+        "embeddings/text-embedding/text-embedding"
     )
     # 模型名称
     vl_model: str = "qwen3.5-omni-flash"                                     # 视觉理解模型
