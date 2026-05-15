@@ -27,9 +27,9 @@ class Settings(BaseSettings):
         "aigc/multimodal-generation/generation"
     )
     # 模型名称
-    vl_model: str = "qwen-vl-plus"                # 视觉理解模型
-    embedding_model: str = "text-embedding-v3"     # 文本向量化模型
-    chat_model: str = "qwen-plus"                  # Agent 对话模型
+    vl_model: str = "qwen3.5-omni-flash"                                     # 视觉理解模型
+    embedding_model: str = "tongyi-embedding-vision-flash-2026-03-06"   # 文本向量化模型
+    chat_model: str = "qwen3.5-flash"                                    # Agent 对话模型
     # 参数
     embedding_dimension: int = 1024                # 向量维度
     vl_timeout: int = 60                           # Qwen-VL 请求超时秒数
