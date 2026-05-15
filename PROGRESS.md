@@ -89,10 +89,10 @@
 | 项 | 文件 | 状态 |
 |----|------|------|
 | 7 个工具函数实现 | `backend/app/agent_tools.py` | ✅ |
-| Agent 对话接口（SSE）`/api/agent/chat` | `backend/app/routers/agent.py` | ⬜ |
-| 确认接口 `/api/agent/confirm` | `backend/app/routers/agent.py` | ⬜ |
-| 对话记忆（Redis） | `backend/app/agent_tools.py` 集成 | ⬜ |
-| 危险操作确认机制 | `backend/app/routers/agent.py` | ⬜ |
+| Agent 对话接口（SSE）`/api/agent/chat` | `backend/app/routers/agent.py` | ✅ |
+| 确认接口 `/api/agent/confirm` | `backend/app/routers/agent.py` | ✅ |
+| 对话记忆（Redis） | `backend/app/routers/agent.py` 集成 | ✅ |
+| 危险操作确认机制 | `backend/app/routers/agent.py` | ✅ |
 | 验证：对话→搜索→分享确认→执行成功 | — | ⬜ |
 
 ---
