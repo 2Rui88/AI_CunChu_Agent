@@ -127,11 +127,9 @@ async def ai_describe(body: dict):
         await _upsert_file_ai_desc(db, md5_val, description, vec)
         # 写入用户记录
         await _upsert_user_ai_desc(db, user, md5_val, description, vec)
-        await db.commit()
 
-        # 追加到 FAISS 索引
+        # FAISS 写入必须在 MySQL commit 之前，保证数据一致
         faiss_id = add_vector(user, vec)
-        # 更新 faiss_id
         await db.execute(
             text(
                 "UPDATE user_file_ai_desc SET faiss_id = :fid "
@@ -273,11 +271,22 @@ def _build_internal_url(db_url: str) -> str:
 
 async def _copy_cache_to_user(db, user: str, md5_val: str, cache) -> dict:
     """从全局缓存 file_ai_desc 复制到用户表 user_file_ai_desc"""
-    vec = np.frombuffer(cache.embedding, dtype=np.float32).copy() if cache.embedding else None
+    if not cache.embedding:
+        return {"code": 1, "msg": "cache embedding is empty"}
+
+    vec = np.frombuffer(cache.embedding, dtype=np.float32).copy()
     await _upsert_user_ai_desc(db, user, md5_val, cache.description, vec)
+
+    # FAISS 写入必须在 MySQL commit 之前，保证两者一致
+    faiss_id = add_vector(user, vec)
+    await db.execute(
+        text(
+            "UPDATE user_file_ai_desc SET faiss_id = :fid "
+            "WHERE user = :user AND md5 = :md5"
+        ),
+        {"fid": faiss_id, "user": user, "md5": md5_val},
+    )
     await db.commit()
-    if vec is not None:
-        add_vector(user, vec)
     return {"code": 0, "msg": "ok"}
 
 
