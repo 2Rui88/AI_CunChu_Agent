@@ -93,7 +93,7 @@ def rebuild_from_db(username: str, vectors: list[np.ndarray]):
     """
     idx = faiss.IndexFlatIP(settings.embedding_dimension)
     for vec in vectors:
-        v = l2_normalize(vec).reshape(1, -1).astype(np.float32)
+        v = l2_normalize(vec.copy()).reshape(1, -1).astype(np.float32)
         idx.add(v)
     save_index(username, idx)
 

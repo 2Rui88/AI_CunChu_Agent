@@ -15,7 +15,7 @@ import zipfile
 import numpy as np
 import httpx
 from fastapi import APIRouter
-from sqlalchemy import select
+from sqlalchemy import select, text
 from app.database import Session
 from app.models import FileInfo, UserFileList, FileAiDesc, UserFileAiDesc
 from app.dependencies import check_token
@@ -133,8 +133,11 @@ async def ai_describe(body: dict):
         faiss_id = add_vector(user, vec)
         # 更新 faiss_id
         await db.execute(
-            f"UPDATE user_file_ai_desc SET faiss_id={faiss_id} "
-            f"WHERE user='{user}' AND md5='{md5_val}'"
+            text(
+                "UPDATE user_file_ai_desc SET faiss_id = :fid "
+                "WHERE user = :user AND md5 = :md5"
+            ),
+            {"fid": faiss_id, "user": user, "md5": md5_val},
         )
         await db.commit()
 
@@ -270,12 +273,11 @@ def _build_internal_url(db_url: str) -> str:
 
 async def _copy_cache_to_user(db, user: str, md5_val: str, cache) -> dict:
     """从全局缓存 file_ai_desc 复制到用户表 user_file_ai_desc"""
-    import numpy as np
-    await _upsert_user_ai_desc(db, user, md5_val, cache.description,
-                               np.frombuffer(cache.embedding, dtype=np.float32)
-                               if cache.embedding else None)
+    vec = np.frombuffer(cache.embedding, dtype=np.float32).copy() if cache.embedding else None
+    await _upsert_user_ai_desc(db, user, md5_val, cache.description, vec)
     await db.commit()
-    add_vector(user, np.frombuffer(cache.embedding, dtype=np.float32))
+    if vec is not None:
+        add_vector(user, vec)
     return {"code": 0, "msg": "ok"}
 
 

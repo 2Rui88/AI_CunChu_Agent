@@ -28,14 +28,14 @@ class Settings(BaseSettings):
     )
     dashscope_emb_url: str = (
         "https://dashscope.aliyuncs.com/api/v1/services/"
-        "embeddings/text-embedding/text-embedding"
+        "embeddings/multimodal-embedding/multimodal-embedding"
     )
     # 模型名称
     vl_model: str = "qwen3.5-omni-flash"                                     # 视觉理解模型
     embedding_model: str = "tongyi-embedding-vision-flash-2026-03-06"   # 文本向量化模型
     chat_model: str = "qwen3.5-flash"                                    # Agent 对话模型
     # 参数
-    embedding_dimension: int = 1024                # 向量维度
+    embedding_dimension: int = 768                 # 向量维度（tongyi-embedding-vision-flash 模型为 768）
     vl_timeout: int = 60                           # Qwen-VL 请求超时秒数
     vl_prompt: str = (
         "请用中文详细描述这张图片的内容，"

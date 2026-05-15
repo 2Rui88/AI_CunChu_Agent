@@ -69,7 +69,7 @@ async def get_embedding(api_key: str, text: str) -> list[float]:
     body = {
         "model": settings.embedding_model,
         "input": {
-            "texts": [text],
+            "contents": [{"text": text}],
         },
         "parameters": {},
     }
