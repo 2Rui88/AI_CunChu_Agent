@@ -3,13 +3,20 @@ FAISS 向量索引封装 —— 每用户独立索引，支持增量添加和余
 
 索引类型: IndexFlatIP（内积搜索，配合 L2 归一化等效余弦相似度）
 索引路径: /data/faiss/users/{md5(username)}.index.bin
+锁路径:    /tmp/faiss_locks/{md5(username)}.lock
+脏标记:    /tmp/faiss_locks/{md5(username)}.dirty
 二进制兼容 C 版本 FAISS 1.7.2 写入的索引文件
 """
 import hashlib
+import os
+import errno
+import fcntl
 from pathlib import Path
 import numpy as np
 import faiss
 from app.config import settings
+
+LOCK_DIR = "/tmp/faiss_locks"
 
 
 def _user_hash(username: str) -> str:
@@ -120,3 +127,56 @@ def get_ntotal(username: str) -> int:
     """获取用户索引中的向量总数"""
     idx = load_index(username)
     return int(idx.ntotal)
+
+
+# ── 脏标记与并发锁 ──
+
+def _lock_path(username: str) -> str:
+    """返回用户锁文件路径"""
+    return os.path.join(LOCK_DIR, f"{_user_hash(username)}.lock")
+
+
+def _dirty_path(username: str) -> str:
+    """返回用户脏标记文件路径"""
+    return os.path.join(LOCK_DIR, f"{_user_hash(username)}.dirty")
+
+
+def is_dirty(username: str) -> bool:
+    """检查用户 FAISS 索引是否需要重建"""
+    return os.path.exists(_dirty_path(username))
+
+
+def clear_dirty(username: str):
+    """清理脏标记（重建成功后调用）"""
+    path = _dirty_path(username)
+    if os.path.exists(path):
+        os.remove(path)
+
+
+def acquire_lock(username: str) -> int:
+    """
+    获取文件锁（排他锁），返回文件描述符。
+    用于防止并发 search/rebuild 同时操作同一用户的索引。
+    返回 -1 表示加锁失败。
+    """
+    os.makedirs(LOCK_DIR, exist_ok=True)
+    path = _lock_path(username)
+    try:
+        fd = os.open(path, os.O_CREAT | os.O_RDWR, 0o644)
+        fcntl.flock(fd, fcntl.LOCK_EX)
+        return fd
+    except OSError:
+        return -1
+
+
+def release_lock(fd: int):
+    """释放文件锁并关闭文件"""
+    if fd >= 0:
+        try:
+            fcntl.flock(fd, fcntl.LOCK_UN)
+        except OSError:
+            pass
+        try:
+            os.close(fd)
+        except OSError:
+            pass

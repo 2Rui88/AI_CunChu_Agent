@@ -28,6 +28,8 @@ from app.faiss_service import (
     l2_normalize,
     get_ntotal,
     load_index,
+    is_dirty, clear_dirty,
+    acquire_lock, release_lock,
 )
 
 router = APIRouter(prefix="/api", tags=["ai"])
@@ -336,6 +338,48 @@ async def _upsert_user_ai_desc(db, user: str, md5_val: str, description: str, ve
         ))
 
 
+async def _auto_rebuild_if_dirty(user: str):
+    """
+    脏标记检测 + 自动重建 FAISS 索引。
+    文件删除后，dealfile 端点会创建 .dirty 文件，搜索前此处自动重建。
+    使用文件锁防止并发搜索触发多次重建。
+    """
+    lock_fd = acquire_lock(user)
+    if lock_fd < 0:
+        return  # 加锁失败，放弃本次重建
+
+    try:
+        # 二次确认（加锁后其他人可能已清理）
+        if not is_dirty(user):
+            return
+
+        async with Session() as db:
+            result = await db.execute(
+                select(UserFileAiDesc).where(
+                    UserFileAiDesc.user == user,
+                    UserFileAiDesc.status == 1,
+                    UserFileAiDesc.embedding.isnot(None),
+                ).order_by(UserFileAiDesc.id)
+            )
+            rows = result.scalars().all()
+
+            if not rows:
+                rebuild_from_db(user, [])
+            else:
+                vectors = [np.frombuffer(r.embedding, dtype=np.float32) for r in rows]
+                rebuild_from_db(user, vectors)
+                # 回写 faiss_id
+                idx = load_index(user)
+                for i, r in enumerate(rows):
+                    if i < idx.ntotal:
+                        r.faiss_id = i
+                await db.commit()
+
+        clear_dirty(user)
+    finally:
+        release_lock(lock_fd)
+
+
 # ============================================================
 #  search —— AI 语义搜索
 # ============================================================
@@ -358,6 +402,13 @@ async def ai_search(body: dict):
 
     if not query or not api_key:
         return {"code": 1, "msg": "missing query or api_key"}
+
+    # 脏标记检测 → 自动重建索引（文件删除后触发）
+    if is_dirty(user):
+        try:
+            await _auto_rebuild_if_dirty(user)
+        except Exception:
+            pass  # 重建失败不影响搜索，用现存索引继续
 
     if get_ntotal(user) == 0:
         return {"code": 0, "count": 0, "files": []}
