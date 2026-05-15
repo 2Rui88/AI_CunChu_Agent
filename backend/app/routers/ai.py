@@ -120,7 +120,11 @@ async def ai_describe(body: dict):
             return {"code": 1, "msg": "describe failed"}
 
         # 向量化
-        embedding = await get_embedding(api_key, description)
+        try:
+            embedding = await get_embedding(api_key, description)
+        except RuntimeError as exc:
+            return {"code": 1, "msg": f"embedding failed: {exc}"}
+
         vec = np.array(embedding, dtype=np.float32)
 
         # 写入全局缓存
@@ -129,15 +133,18 @@ async def ai_describe(body: dict):
         await _upsert_user_ai_desc(db, user, md5_val, description, vec)
 
         # FAISS 写入必须在 MySQL commit 之前，保证数据一致
-        faiss_id = add_vector(user, vec)
-        await db.execute(
-            text(
-                "UPDATE user_file_ai_desc SET faiss_id = :fid "
-                "WHERE user = :user AND md5 = :md5"
-            ),
-            {"fid": faiss_id, "user": user, "md5": md5_val},
-        )
-        await db.commit()
+        try:
+            faiss_id = add_vector(user, vec)
+            await db.execute(
+                text(
+                    "UPDATE user_file_ai_desc SET faiss_id = :fid "
+                    "WHERE user = :user AND md5 = :md5"
+                ),
+                {"fid": faiss_id, "user": user, "md5": md5_val},
+            )
+            await db.commit()
+        except Exception:
+            return {"code": 1, "msg": "faiss write failed"}
 
     return {"code": 0, "msg": "ok"}
 
@@ -356,9 +363,16 @@ async def ai_search(body: dict):
         return {"code": 0, "count": 0, "files": []}
 
     # 查询文本 → 向量 → L2 归一化 → FAISS 搜索
-    embedding = await get_embedding(api_key, query)
+    try:
+        embedding = await get_embedding(api_key, query)
+    except RuntimeError as exc:
+        return {"code": 1, "msg": f"embedding failed: {exc}"}
+
     query_vec = np.array(embedding, dtype=np.float32)
-    results = faiss_search(user, query_vec, top_k)
+    try:
+        results = faiss_search(user, query_vec, top_k)
+    except Exception as exc:
+        return {"code": 1, "msg": f"faiss search failed: {exc}"}
 
     # faiss_id → MySQL 联表查询
     async with Session() as db:
@@ -424,7 +438,10 @@ async def ai_rebuild(body: dict):
             return {"code": 0, "msg": "rebuilt", "count": 0}
 
         vectors = [np.frombuffer(r.embedding, dtype=np.float32) for r in rows]
-        rebuild_from_db(user, vectors)
+        try:
+            rebuild_from_db(user, vectors)
+        except Exception as exc:
+            return {"code": 1, "msg": f"faiss rebuild failed: {exc}"}
 
         # 更新 faiss_id（重建后 id 从 0 重新分配）
         idx = load_index(user)

@@ -27,14 +27,18 @@ def _index_path(username: str) -> str:
 def load_index(username: str, dim: int | None = None) -> faiss.IndexFlatIP:
     """
     加载用户 FAISS 索引。如果索引文件存在则从磁盘读取，否则创建新的空索引。
-    IndexFlatIP 配合 L2 归一化向量后，内积结果等价于余弦相似度，范围 [-1, 1]。
+    如果磁盘索引的维度与配置不符，则删除旧索引并创建新索引。
     """
     dimension = dim or settings.embedding_dimension
     path = _index_path(username)
 
     if Path(path).exists():
         idx = faiss.read_index(path)
-        return idx
+        if idx.d == dimension:
+            return idx
+        # 维度不匹配（模型切换导致），删除旧索引重建
+        Path(path).unlink()
+        return faiss.IndexFlatIP(dimension)
 
     return faiss.IndexFlatIP(dimension)
 
@@ -102,7 +106,10 @@ def l2_normalize(vec: np.ndarray) -> np.ndarray:
     """
     L2 归一化（原地修改 + 返回引用）。
     归一化后，IndexFlatIP 的内积 = 余弦相似度，范围 [-1, 1]。
+    空向量或零范数向量不做归一化，直接返回。
     """
+    if vec.size == 0:
+        return vec
     norm = np.linalg.norm(vec)
     if norm > 1e-10:
         vec /= norm

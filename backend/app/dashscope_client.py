@@ -23,8 +23,8 @@ def create_client(api_key: str) -> AsyncOpenAI:
 async def describe_image(api_key: str, image_url: str) -> str:
     """
     调用 Qwen-VL 多模态模型，传入图片公网 URL，返回中文图片描述。
-    使用 httpx 直调 DashScope 多模态生成 API（不走 OpenAI 兼容接口，因为
-    Qwen-VL 的多模态消息格式与 OpenAI Chat 格式不同）。
+    使用 httpx 直调 DashScope 多模态生成 API。
+    网络异常或 API 错误时返回降级描述文案。
     """
     body = {
         "model": settings.vl_model,
@@ -39,16 +39,19 @@ async def describe_image(api_key: str, image_url: str) -> str:
         },
     }
 
-    async with httpx.AsyncClient(timeout=settings.vl_timeout) as client:
-        resp = await client.post(
-            settings.dashscope_vl_url,
-            json=body,
-            headers={
-                "Authorization": f"Bearer {api_key}",
-                "Content-Type": "application/json",
-            },
-        )
-        data = resp.json()
+    try:
+        async with httpx.AsyncClient(timeout=settings.vl_timeout) as client:
+            resp = await client.post(
+                settings.dashscope_vl_url,
+                json=body,
+                headers={
+                    "Authorization": f"Bearer {api_key}",
+                    "Content-Type": "application/json",
+                },
+            )
+            data = resp.json()
+    except Exception as exc:
+        return "无法描述此图片"
 
     # 响应路径: output.choices[0].message.content[0].text
     try:
@@ -64,7 +67,7 @@ async def get_embedding(api_key: str, text: str) -> list[float]:
     """
     调用 DashScope 原生文本向量化 API，将文本转为浮点向量。
     使用 httpx 直调原生接口（不走 OpenAI 兼容端点），支持所有原生模型名。
-    向量维度由 settings.embedding_dimension 决定。
+    失败时抛出 RuntimeError，由调用方统一处理。
     """
     body = {
         "model": settings.embedding_model,
@@ -73,23 +76,32 @@ async def get_embedding(api_key: str, text: str) -> list[float]:
         },
         "parameters": {},
     }
-    # 部分模型支持自定义维度，不支持的会自动忽略
     if settings.embedding_dimension:
         body["parameters"]["dimension"] = settings.embedding_dimension
 
-    async with httpx.AsyncClient(timeout=30) as client:
-        resp = await client.post(
-            settings.dashscope_emb_url,
-            json=body,
-            headers={
-                "Authorization": f"Bearer {api_key}",
-                "Content-Type": "application/json",
-            },
+    try:
+        async with httpx.AsyncClient(timeout=30) as client:
+            resp = await client.post(
+                settings.dashscope_emb_url,
+                json=body,
+                headers={
+                    "Authorization": f"Bearer {api_key}",
+                    "Content-Type": "application/json",
+                },
+            )
+            data = resp.json()
+    except Exception as exc:
+        raise RuntimeError(f"向量化 API 请求失败: {exc}") from exc
+
+    # 检查 API 错误码
+    if data.get("code") and data.get("code") != "":
+        raise RuntimeError(
+            f"向量化 API 返回错误: code={data.get('code')}, "
+            f"message={data.get('message', '')}"
         )
-        data = resp.json()
 
     # 响应路径: output.embeddings[0].embedding
     try:
         return data["output"]["embeddings"][0]["embedding"]
-    except (KeyError, IndexError, TypeError):
-        return []
+    except (KeyError, IndexError, TypeError) as exc:
+        raise RuntimeError(f"向量化响应解析失败: 不支持的响应格式") from exc
