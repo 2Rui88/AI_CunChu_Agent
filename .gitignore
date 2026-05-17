@@ -18,12 +18,16 @@ picture_bed/build/
 .vscode/
 .idea/
 
+# Claude 内部文件
+.claude/
+
 # 系统
 .DS_Store
 Thumbs.db
 
 # Docker
 docker/nginx/ssl/
+docker/.env
 
 # 旧 C 项目产物（保留不动）
 bin_cgi/
