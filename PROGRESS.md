@@ -107,7 +107,7 @@
 | SSE 客户端 | `frontend/src/services/agent.js` | ✅ |
 | NavBar 聊天入口 | `frontend/src/components/NavBar.js` | ✅ |
 | Gunicorn 生产配置 | `backend/gunicorn.conf.py` | ✅ |
-| Let's Encrypt 证书 | `docker/nginx/ssl/` | ⬜ |
+| Let's Encrypt 证书 | `docker/nginx/setup-certbot.sh` | ✅ |
 | 最终全链路验证 | — | ⬜ |
 
 ---
