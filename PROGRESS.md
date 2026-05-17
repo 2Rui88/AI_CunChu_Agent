@@ -106,7 +106,7 @@
 | ConfirmModal 确认弹窗 | `frontend/src/components/ConfirmModal.js` | ✅ |
 | SSE 客户端 | `frontend/src/services/agent.js` | ✅ |
 | NavBar 聊天入口 | `frontend/src/components/NavBar.js` | ✅ |
-| Gunicorn 生产配置 | `backend/gunicorn.conf.py` | ⬜ |
+| Gunicorn 生产配置 | `backend/gunicorn.conf.py` | ✅ |
 | Let's Encrypt 证书 | `docker/nginx/ssl/` | ⬜ |
 | 最终全链路验证 | — | ⬜ |
 
