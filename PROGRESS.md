@@ -108,7 +108,7 @@
 | NavBar 聊天入口 | `frontend/src/components/NavBar.js` | ✅ |
 | Gunicorn 生产配置 | `backend/gunicorn.conf.py` | ✅ |
 | Let's Encrypt 证书 | `docker/nginx/setup-certbot.sh` | ✅ |
-| 最终全链路验证 | — | ⬜ |
+| 最终全链路验证 | — | ✅ |
 
 ---
 
