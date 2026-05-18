@@ -37,6 +37,7 @@ class Settings(BaseSettings):
     # 参数
     embedding_dimension: int = 768                 # 向量维度（tongyi-embedding-vision-flash 模型为 768）
     vl_timeout: int = 60                           # Qwen-VL 请求超时秒数
+    pdf_max_extract_chars: int = 8000              # PDF 单次提取最大字符数
     vl_prompt: str = (
         "请用中文详细描述这张图片的内容，"
         "包括主要物体、场景、颜色、文字等信息。"

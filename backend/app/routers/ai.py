@@ -12,6 +12,7 @@ rebuild:  从 MySQL 全量重建用户 FAISS 索引
 import io
 import re
 import zipfile
+import fitz  # PyMuPDF
 import numpy as np
 import httpx
 from fastapi import APIRouter
@@ -173,6 +174,19 @@ async def _generate_description(db, md5_val: str, filename: str, file_type: str,
             return desc
         return f"图片文件：{filename}"
 
+    # ── PDF：下载二进制后提取文本 ──
+    if ft == "pdf":
+        result = await db.execute(
+            select(FileInfo).where(FileInfo.md5 == md5_val).limit(1)
+        )
+        fi = result.scalar()
+        if fi and fi.url:
+            internal_url = _build_internal_url(fi.url)
+            content = await _download_and_extract_pdf(internal_url, filename)
+            if content:
+                return content
+        return f"PDF文件：{filename}"
+
     # ── 文本类 / docx：下载文件提取内容 ──
     if ft in _TEXT_TYPES or ft == "docx":
         result = await db.execute(
@@ -257,6 +271,107 @@ def _format_text_description(filename: str, content: str) -> str:
     """格式化文本/文档描述：文件名 + 内容（截断到 3000 字符）"""
     desc_len = min(len(content), 3000)
     return f"文件名：{filename}\n文件内容：{content[:desc_len]}"
+
+
+# ── PDF 文本提取 ──
+
+async def _download_and_extract_pdf(file_url: str, filename: str) -> str | None:
+    """下载 PDF 二进制并提取文本，返回格式化后的描述"""
+    try:
+        async with httpx.AsyncClient(timeout=30) as client:
+            resp = await client.get(file_url)
+            if resp.status_code != 200:
+                return None
+            data = resp.content
+    except Exception:
+        return None
+
+    return _extract_pdf_text(data, filename)
+
+
+def _extract_pdf_text(data: bytes, filename: str) -> str:
+    """
+    从 PDF 二进制数据提取文本。
+    处理：空 PDF、加密 PDF、扫描型 PDF、超大 PDF 截断。
+    返回格式化的描述文本。
+    """
+    if not data or len(data) == 0:
+        return f"PDF文件（空文件）：{filename}"
+
+    # 打开 PDF
+    try:
+        doc = fitz.open(stream=data, filetype="pdf")
+    except Exception:
+        return f"PDF文件：{filename}"
+
+    # 加密检测
+    if doc.is_encrypted:
+        doc.close()
+        return f"PDF文件（已加密，无法提取文本）：{filename}"
+
+    total = doc.page_count
+    if total == 0:
+        doc.close()
+        return f"PDF文件（无页面）：{filename}"
+
+    max_chars = settings.pdf_max_extract_chars
+
+    # 逐页提取
+    text_parts: list[str] = []
+    scanned = 0
+    for i in range(total):
+        try:
+            page = doc.load_page(i)
+        except Exception:
+            continue
+
+        page_text = page.get_text("text").strip() if page else ""
+        if not page_text:
+            # 检测扫描页（有图片无文本）
+            try:
+                imgs = page.get_images()
+            except Exception:
+                imgs = []
+            if imgs:
+                scanned += 1
+            continue
+
+        text_parts.append(page_text)
+        if sum(len(t) for t in text_parts) > max_chars * 2:
+            break
+
+    doc.close()
+
+    # 无文本
+    if not text_parts:
+        if scanned > 0:
+            return f"PDF文件（疑似扫描型，{scanned}/{total} 页无文本）：{filename}"
+        return f"PDF文件（无可提取文本）：{filename}"
+
+    # 拼接 + 清洗 + 截断
+    raw = "\n".join(text_parts)
+    raw = _clean_pdf_text(raw)
+
+    if len(raw) > max_chars:
+        raw = raw[:max_chars]
+        last_period = raw.rfind("。")
+        if last_period > max_chars // 2:
+            raw = raw[:last_period + 1]
+
+    note = ""
+    if scanned > 0:
+        note = f"（注：{scanned}/{total} 页为扫描页，已跳过）\n"
+
+    return f"文件名：{filename}\n{note}PDF内容：{raw}"
+
+
+def _clean_pdf_text(text: str) -> str:
+    """清洗 PDF 提取文本：去控制字符、合并空白、规整换行"""
+    text = text.replace("\t", " ")
+    text = re.sub(r" {2,}", " ", text)
+    text = re.sub(r"\n{3,}", "\n\n", text)
+    text = "\n".join(line.strip() for line in text.splitlines())
+    return text.strip()
 
 
 def _build_internal_url(db_url: str) -> str:
