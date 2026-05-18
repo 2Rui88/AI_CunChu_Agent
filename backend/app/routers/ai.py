@@ -13,6 +13,7 @@ import io
 import re
 import zipfile
 import fitz  # PyMuPDF
+import openpyxl
 import numpy as np
 import httpx
 from fastapi import APIRouter
@@ -186,6 +187,19 @@ async def _generate_description(db, md5_val: str, filename: str, file_type: str,
             if content:
                 return content
         return f"PDF文件：{filename}"
+
+    # ── Excel (xlsx)：下载二进制后解析表格文本 ──
+    if ft in ("xlsx", "xls"):
+        result = await db.execute(
+            select(FileInfo).where(FileInfo.md5 == md5_val).limit(1)
+        )
+        fi = result.scalar()
+        if fi and fi.url:
+            internal_url = _build_internal_url(fi.url)
+            content = await _download_and_extract_xlsx(internal_url, filename)
+            if content:
+                return content
+        return f"Excel文件：{filename}"
 
     # ── 文本类 / docx：下载文件提取内容 ──
     if ft in _TEXT_TYPES or ft == "docx":
@@ -372,6 +386,81 @@ def _clean_pdf_text(text: str) -> str:
     text = re.sub(r"\n{3,}", "\n\n", text)
     text = "\n".join(line.strip() for line in text.splitlines())
     return text.strip()
+
+
+# ── Excel 表格提取 ──
+
+async def _download_and_extract_xlsx(file_url: str, filename: str) -> str | None:
+    """下载 Excel 二进制并提取文本，返回格式化后的描述"""
+    try:
+        async with httpx.AsyncClient(timeout=30) as client:
+            resp = await client.get(file_url)
+            if resp.status_code != 200:
+                return None
+            data = resp.content
+    except Exception:
+        return None
+
+    return _extract_xlsx_text(data, filename)
+
+
+def _extract_xlsx_text(data: bytes, filename: str) -> str:
+    """
+    从 Excel 二进制数据提取文本。
+    逐 sheet 遍历所有有数据的行，以制表符分隔单元格，拼接为可读文本。
+    """
+    if not data or len(data) == 0:
+        return f"Excel文件（空文件）：{filename}"
+
+    try:
+        wb = openpyxl.load_workbook(io.BytesIO(data), read_only=True, data_only=True)
+    except Exception:
+        return f"Excel文件（无法解析）：{filename}"
+
+    max_chars = settings.pdf_max_extract_chars  # 复用同一截断配置
+    parts: list[str] = []
+    sheet_count = 0
+    empty_sheets = 0
+
+    for name in wb.sheetnames:
+        ws = wb[name]
+        sheet_count += 1
+        sheet_parts = [f"【{name}】"]
+
+        row_count = 0
+        for row in ws.iter_rows(values_only=True):
+            # 跳过全空行
+            values = [str(v) if v is not None else "" for v in row]
+            if not any(v for v in values):
+                continue
+            sheet_parts.append("\t".join(values))
+            row_count += 1
+            # 提前截断
+            total = sum(len(p) for p in parts) + sum(len(p) for p in sheet_parts)
+            if total > max_chars * 2:
+                break
+
+        if row_count == 0:
+            empty_sheets += 1
+        else:
+            parts.extend(sheet_parts)
+
+    wb.close()
+
+    if not parts:
+        return f"Excel文件（{sheet_count} 个工作表均无数据）：{filename}"
+
+    raw = "\n".join(parts)
+    raw = _clean_pdf_text(raw)  # 复用清洗逻辑
+
+    if len(raw) > max_chars:
+        raw = raw[:max_chars]
+        last_line = raw.rfind("\n")
+        if last_line > max_chars // 2:
+            raw = raw[:last_line]
+
+    note = f"（共 {sheet_count} 个工作表）\n" if sheet_count > 1 else ""
+    return f"文件名：{filename}\n{note}表格内容：\n{raw}"
 
 
 def _build_internal_url(db_url: str) -> str:
