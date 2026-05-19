@@ -16,10 +16,12 @@
 使用入口：chunk_text(file_type, text, max_chars) -> list[Chunk]
 """
 
+import re
 from dataclasses import dataclass
 from typing import Optional
 
-from app.config import settings
+# 默认分块字符数（模块级常量，避免导入 app.config 中的重量级依赖）
+_DEFAULT_MAX_CHARS = 3000
 
 
 @dataclass
@@ -181,16 +183,133 @@ class FallbackChunker(BaseChunker):
         return first
 
 
+class MarkdownChunker(BaseChunker):
+    """
+    Markdown 标题切分器 —— 以 ## 级标题为边界切分。
+
+    适用场景：.md 文件，以及含 Markdown 标题的文档。
+    切分规则：
+      1. 以 ## 开头的行作为切分边界
+      2. 标题行前的聚合文本归入上一节或作为无标题首节
+      3. 单节超限时尝试 ### 子标题，再无则按段落切分
+      4. context_label 取自所属标题行文本
+    """
+
+    _HEADING_PATTERN = re.compile(r"^(#{1,6})\s+(.+)", re.MULTILINE)
+
+    def chunk(self, text: str, max_chars: int,
+              metadata: Optional[dict] = None) -> list[Chunk]:
+        if not text or not text.strip():
+            return [Chunk(index=0, text=text or "", context_label="")]
+
+        if len(text) <= max_chars:
+            return [Chunk(index=0, text=text, context_label="")]
+
+        sections = self._split_by_headings(text)
+        chunks = self._build_chunks(sections, max_chars)
+        return chunks
+
+    @staticmethod
+    def _split_by_headings(text: str) -> list[tuple[str, str]]:
+        """
+        以 ## 标题为边界拆分文本。
+        返回 [(label, content), ...]，首节 label 可为空。
+        """
+        # 找所有 ## 标题位置
+        pattern = re.compile(r"^##\s+.+$", re.MULTILINE)
+        matches = list(pattern.finditer(text))
+
+        if not matches:
+            return [("", text)]
+
+        sections: list[tuple[str, str]] = []
+
+        # 第一个标题之前的内容 → 无标题首节
+        if matches[0].start() > 0:
+            before = text[:matches[0].start()].strip()
+            if before:
+                sections.append(("", before))
+
+        # 逐个标题区间
+        for i, m in enumerate(matches):
+            label = m.group().strip()
+            start = m.end()
+            end = matches[i + 1].start() if i + 1 < len(matches) else len(text)
+            content = text[start:end].strip()
+            if content:
+                sections.append((label, content))
+
+        return sections
+
+    def _build_chunks(self, sections: list[tuple[str, str]],
+                      max_chars: int) -> list[Chunk]:
+        """将标题-内容对转为 Chunk 列表，超限节递归用 ### 子标题切分"""
+        chunks: list[Chunk] = []
+
+        for label, content in sections:
+            if len(content) <= max_chars:
+                chunks.append(Chunk(index=len(chunks), text=content,
+                                    context_label=label))
+            else:
+                # 超限节尝试 ### 子标题
+                sub_sections = self._split_by_subheadings(content, label)
+                for sub_label, sub_content in sub_sections:
+                    if len(sub_content) <= max_chars:
+                        chunks.append(Chunk(index=len(chunks),
+                                            text=sub_content,
+                                            context_label=sub_label or label))
+                    else:
+                        # 仍超限 → 回落段落切分
+                        fallback = FallbackChunker()
+                        sub_chunks = fallback.chunk(sub_content, max_chars)
+                        for sc in sub_chunks:
+                            sc.context_label = sub_label or label
+                            sc.index = len(chunks)
+                            chunks.append(sc)
+
+        return chunks
+
+    @staticmethod
+    def _split_by_subheadings(content: str, parent_label: str
+                              ) -> list[tuple[str, str]]:
+        """
+        以 ### 子标题拆分超限节内容。
+        返回 [(label, content), ...]，无子标题则返回原始整节。
+        """
+        pattern = re.compile(r"^###\s+.+$", re.MULTILINE)
+        matches = list(pattern.finditer(content))
+
+        if not matches:
+            return [(parent_label, content)]
+
+        sections: list[tuple[str, str]] = []
+
+        if matches[0].start() > 0:
+            before = content[:matches[0].start()].strip()
+            if before:
+                sections.append((parent_label, before))
+
+        for i, m in enumerate(matches):
+            sub_label = m.group().strip()
+            start = m.end()
+            end = matches[i + 1].start() if i + 1 < len(matches) else len(content)
+            sub_content = content[start:end].strip()
+            if sub_content:
+                sections.append((sub_label, sub_content))
+
+        return sections
+
+
 # ── 策略路由 ──
 
 # 文件类型 → 分块器映射（逐步注册）
 _CHUNKER_REGISTRY: dict[str, BaseChunker] = {
     "fallback": FallbackChunker(),
+    "md": MarkdownChunker(),
     # 后续阶段注册：
     # "pdf": PDFChunker(),
     # "py": CodeChunker(),
     # "js": CodeChunker(),
-    # "md": MarkdownChunker(),
     # "xlsx": ExcelChunker(),
     # "xls": ExcelChunker(),
     # "docx": DocxChunker(),
