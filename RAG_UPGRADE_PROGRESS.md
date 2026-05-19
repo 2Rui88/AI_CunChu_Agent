@@ -8,7 +8,7 @@
 
 | 项 | 文件 | 状态 |
 |----|------|------|
-| 通用段落切分器 FallbackChunker | `backend/app/chunker.py` | ⬜ |
+| 通用段落切分器 FallbackChunker | `backend/app/chunker.py` | ✅ |
 | Markdown 标题切分器 | `backend/app/chunker.py` | ⬜ |
 | 代码函数/类切分器 | `backend/app/chunker.py` | ⬜ |
 | PDF 页面 + 字号检测切分器 | `backend/app/chunker.py` | ⬜ |
