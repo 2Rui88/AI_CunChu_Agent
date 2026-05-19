@@ -36,6 +36,7 @@ class Settings(BaseSettings):
     chat_model: str = "qwen3.5-flash"                                    # Agent 对话模型
     # 参数
     embedding_dimension: int = 768                 # 向量维度（tongyi-embedding-vision-flash 模型为 768）
+    embedding_max_chars: int = 3000               # 单切片最大字符数（分块阈值，与模型 token 上限对齐）
     vl_timeout: int = 60                           # Qwen-VL 请求超时秒数
     pdf_max_extract_chars: int = 8000              # PDF 单次提取最大字符数
     vl_prompt: str = (
