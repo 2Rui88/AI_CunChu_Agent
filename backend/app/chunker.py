@@ -503,6 +503,90 @@ class PDFChunker(BaseChunker):
         return f"第{pages[0] + 1}-{pages[-1] + 1}页"
 
 
+class ExcelChunker(BaseChunker):
+    """
+    Excel 工作表切分器 —— 以工作表为一级边界，工作表内按行数分组。
+
+    适用场景：.xlsx .xls 文件。
+    切分规则：
+      1. 每个工作表为一级边界
+      2. 工作表内按 max_chars 对行分组
+      3. context_label = "Sheet名" 或 "Sheet名 (行1-10)"
+      4. 无 metadata 时回退 FallbackChunker
+    """
+
+    def chunk(self, text: str, max_chars: int,
+              metadata: Optional[dict] = None) -> list[Chunk]:
+        sheets = (metadata or {}).get("sheets", [])
+        if not sheets:
+            fallback = FallbackChunker()
+            return fallback.chunk(text, max_chars)
+
+        chunks: list[Chunk] = []
+        for sheet in sheets:
+            name = sheet.get("name", "")
+            rows = sheet.get("rows", [])
+            if not rows:
+                continue
+            sub = self._chunk_rows(rows, name, max_chars)
+            for sc in sub:
+                sc.index = len(chunks)
+                chunks.append(sc)
+
+        return chunks if chunks else [Chunk(index=0, text=text or "", context_label="")]
+
+    @staticmethod
+    def _chunk_rows(rows: list[list[str]], sheet_name: str,
+                    max_chars: int) -> list[Chunk]:
+        """将二维行列表逐行拼接为切片，以 max_chars 为上限分组"""
+        chunks: list[Chunk] = []
+        buf_rows: list[int] = []
+        buf_text: list[str] = []
+        buf_len = 0
+
+        for i, row in enumerate(rows):
+            row_str = "\t".join(str(v) if v is not None else "" for v in row)
+            if not row_str.strip():
+                continue
+
+            new_len = buf_len + len(row_str) + (1 if buf_text else 0)
+            if new_len <= max_chars:
+                buf_rows.append(i)
+                buf_text.append(row_str)
+                buf_len = new_len
+            else:
+                if buf_text:
+                    label = ExcelChunker._row_label(sheet_name, buf_rows)
+                    chunks.append(Chunk(index=len(chunks),
+                                        text="\n".join(buf_text),
+                                        context_label=label))
+                # 单行超大 → 单独成块
+                if len(row_str) > max_chars:
+                    label = ExcelChunker._row_label(sheet_name, [i])
+                    chunks.append(Chunk(index=len(chunks),
+                                        text=row_str[:max_chars],
+                                        context_label=label))
+                    buf_rows, buf_text, buf_len = [], [], 0
+                else:
+                    buf_rows = [i]
+                    buf_text = [row_str]
+                    buf_len = len(row_str)
+
+        if buf_text:
+            label = ExcelChunker._row_label(sheet_name, buf_rows)
+            chunks.append(Chunk(index=len(chunks), text="\n".join(buf_text),
+                                context_label=label))
+
+        return chunks
+
+    @staticmethod
+    def _row_label(sheet_name: str, row_indices: list[int]) -> str:
+        """生成行范围标签"""
+        if len(row_indices) == 1:
+            return f"{sheet_name} (行{row_indices[0] + 1})"
+        return f"{sheet_name} (行{row_indices[0] + 1}-{row_indices[-1] + 1})"
+
+
 # ── 策略路由 ──
 
 # 文件类型 → 分块器映射
@@ -519,9 +603,9 @@ _CHUNKER_REGISTRY: dict[str, BaseChunker] = {
     "go": CodeChunker(),
     "rs": CodeChunker(),
     "pdf": PDFChunker(),
+    "xlsx": ExcelChunker(),
+    "xls": ExcelChunker(),
     # 后续阶段注册：
-    # "xlsx": ExcelChunker(),
-    # "xls": ExcelChunker(),
     # "docx": DocxChunker(),
 }
 
