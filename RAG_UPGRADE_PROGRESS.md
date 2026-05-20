@@ -12,7 +12,7 @@
 | Markdown 标题切分器 | `backend/app/chunker.py` | ✅ |
 | 代码函数/类切分器 | `backend/app/chunker.py` | ✅ |
 | PDF 页面 + 字号检测切分器 | `backend/app/chunker.py` | ✅ |
-| Excel 工作表切分器 | `backend/app/chunker.py` | ⬜ |
+| Excel 工作表切分器 | `backend/app/chunker.py` | ✅ |
 | docx 标题样式切分器 | `backend/app/chunker.py` | ⬜ |
 | 分块策略路由（按文件类型选择切分器） | `backend/app/chunker.py` | ⬜ |
 | 上下文继承逻辑（超限切片带父标题） | `backend/app/chunker.py` | ⬜ |
