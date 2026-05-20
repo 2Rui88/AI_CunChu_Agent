@@ -300,16 +300,226 @@ class MarkdownChunker(BaseChunker):
         return sections
 
 
+class CodeChunker(BaseChunker):
+    """
+    代码函数/类切分器 —— 以函数声明和类声明为边界切分。
+
+    适用场景：.py .js .ts .java .c .cpp .h .go .rs 等源代码文件。
+    切分规则：
+      1. 以函数声明（def / function / fn / func 等）或类声明（class）为边界
+      2. 声明行之前的内容归入上一块或作为文件头（import / 注释等）
+      3. 单函数超限不拆分（函数体完整性优先）
+      4. context_label 取自函数名/类名
+    """
+
+    # 函数/类声明正则（匹配 Python/JS/TS/Java/C/C++/Go/Rust）
+    _FUNC_CLASS_PATTERN = re.compile(
+        r"^(\s*)"                        # 缩进（顶层为0）
+        r"(?:"                           # 以下任一：
+        r"(?:async\s+)?def\s+(\w+)"      #   Python async def / def
+        r"|function\s+(\w+)"             #   JS function
+        r"|(?:public\s+|private\s+|protected\s+|static\s+)*"  # 修饰符
+        r"(?:class|interface)\s+(\w+)"   #   class / interface
+        r"|fn\s+(\w+)"                   #   Rust fn
+        r"|func\s+(\w+)"                 #   Go func
+        r"|(?:void|int|char|float|double|long|short|bool|auto|"
+        r"string|String|void)\s+(\w+)\s*\([^)]*\)\s*\{?"  # C/C++/Java 函数
+        r")",
+        re.MULTILINE,
+    )
+
+    def chunk(self, text: str, max_chars: int,
+              metadata: Optional[dict] = None) -> list[Chunk]:
+        if not text or not text.strip():
+            return [Chunk(index=0, text=text or "", context_label="")]
+
+        if len(text) <= max_chars:
+            return [Chunk(index=0, text=text, context_label="")]
+
+        matches = list(self._FUNC_CLASS_PATTERN.finditer(text))
+
+        if len(matches) < 2:
+            # 声明不足两个，整段作为一个切片
+            label = self._first_func_name(matches) if matches else ""
+            return self._oversized_chunks(text, label, max_chars)
+
+        chunks: list[Chunk] = []
+
+        # 第一个声明之前 → 文件头
+        first = matches[0]
+        if first.start() > 0:
+            before = text[:first.start()].strip()
+            if before:
+                chunks.append(Chunk(index=0, text=before, context_label="文件头"))
+
+        # 逐个函数/类区间
+        for i, m in enumerate(matches):
+            name = self._extract_name(m)
+            label = self._make_func_label(m.group(), name)
+            start = m.start()
+            end = matches[i + 1].start() if i + 1 < len(matches) else len(text)
+            content = text[start:end].strip()
+
+            if not content:
+                continue
+
+            if len(content) <= max_chars:
+                chunks.append(Chunk(index=len(chunks), text=content,
+                                    context_label=label))
+            else:
+                # 单函数超限不拆分，保证函数完整性
+                sub = self._oversized_chunks(content, label, max_chars)
+                for sc in sub:
+                    sc.index = len(chunks)
+                    chunks.append(sc)
+
+        return chunks if chunks else self._oversized_chunks(text, "", max_chars)
+
+    @staticmethod
+    def _first_func_name(matches: list) -> str:
+        """从首个匹配提取函数名"""
+        return CodeChunker._extract_name(matches[0])
+
+    @staticmethod
+    def _extract_name(match: re.Match) -> str:
+        """从正则匹配组中提取第一个有效名称（跳过缩进组和空字符串）"""
+        for g in match.groups()[1:]:  # 跳过 group(1)（缩进）
+            if g and g.strip():
+                return g.strip()
+        return ""
+
+    @staticmethod
+    def _make_func_label(raw_decl: str, name: str) -> str:
+        """生成 context_label"""
+        if name:
+            return name
+        return raw_decl.strip()[:40]
+
+    @staticmethod
+    def _oversized_chunks(text: str, label: str, max_chars: int) -> list[Chunk]:
+        """超限时按 max_chars 硬切，所有切片共享同一 label"""
+        chunks: list[Chunk] = []
+        for i in range(0, len(text), max_chars):
+            chunks.append(Chunk(index=len(chunks), text=text[i:i + max_chars],
+                                context_label=label))
+        return chunks
+
+
+class PDFChunker(BaseChunker):
+    """
+    PDF 页面 + 字号检测切分器。
+
+    适用场景：PDF 文件的逐页提取文本。
+    切分规则：
+      1. 以页面为基本单位（metadata["pages"] 传入每页文本列表）
+      2. 相邻小页面合并至接近 max_chars
+      3. 单页超大时按页面内的段落边界切分
+      4. 字号突变信号预留入口（metadata["font_sizes"] 传入）
+      5. context_label = "第N页" 或 "第N-M页"
+    """
+
+    def chunk(self, text: str, max_chars: int,
+              metadata: Optional[dict] = None) -> list[Chunk]:
+        # 优先从 metadata 中获取逐页文本
+        pages = (metadata or {}).get("pages", [])
+        font_sizes = (metadata or {}).get("font_sizes", [])
+
+        if pages:
+            return self._chunk_by_pages(pages, font_sizes, max_chars)
+
+        # 无页面信息 → 回落文本切分
+        if not text or not text.strip():
+            return [Chunk(index=0, text=text or "", context_label="")]
+
+        if len(text) <= max_chars:
+            return [Chunk(index=0, text=text, context_label="")]
+
+        fallback = FallbackChunker()
+        return fallback.chunk(text, max_chars)
+
+    @staticmethod
+    def _chunk_by_pages(pages: list[str], font_sizes: list,
+                        max_chars: int) -> list[Chunk]:
+        """按页面分组切分，合并相邻小页面"""
+        chunks: list[Chunk] = []
+        buf_pages: list[int] = []
+        buf_text: list[str] = []
+        buf_len = 0
+
+        for i, page_text in enumerate(pages):
+            text_i = page_text.strip()
+            if not text_i:
+                continue
+
+            # 字号突变检测（预留扩展，当前仅记录）
+            if i < len(font_sizes) and buf_pages:
+                last_size = font_sizes[buf_pages[-1]] if buf_pages[-1] < len(font_sizes) else 0
+                curr_size = font_sizes[i]
+                if last_size and curr_size and abs(last_size - curr_size) > 4:
+                    # 字号突变 → 落盘当前缓冲区
+                    label = PDFChunker._page_range_label(buf_pages)
+                    chunks.append(Chunk(index=len(chunks),
+                                        text="\n".join(buf_text),
+                                        context_label=label))
+                    buf_pages, buf_text, buf_len = [], [], 0
+
+            # 合并判断
+            new_len = buf_len + len(text_i) + (1 if buf_text else 0)
+            if new_len <= max_chars:
+                buf_pages.append(i)
+                buf_text.append(text_i)
+                buf_len = new_len
+            else:
+                # 落盘缓冲区
+                if buf_text:
+                    label = PDFChunker._page_range_label(buf_pages)
+                    chunks.append(Chunk(index=len(chunks),
+                                        text="\n".join(buf_text),
+                                        context_label=label))
+                # 单页超大 → 单独成块
+                if len(text_i) > max_chars:
+                    label = PDFChunker._page_range_label([i])
+                    sub_text = text_i[:max_chars]
+                    chunks.append(Chunk(index=len(chunks), text=sub_text,
+                                        context_label=label))
+                    buf_pages, buf_text, buf_len = [], [], 0
+                else:
+                    buf_pages = [i]
+                    buf_text = [text_i]
+                    buf_len = len(text_i)
+
+        if buf_text:
+            label = PDFChunker._page_range_label(buf_pages)
+            chunks.append(Chunk(index=len(chunks), text="\n".join(buf_text),
+                                context_label=label))
+
+        return chunks
+
+    @staticmethod
+    def _page_range_label(pages: list[int]) -> str:
+        """生成页面范围标签"""
+        if len(pages) == 1:
+            return f"第{pages[0] + 1}页"
+        return f"第{pages[0] + 1}-{pages[-1] + 1}页"
+
+
 # ── 策略路由 ──
 
-# 文件类型 → 分块器映射（逐步注册）
+# 文件类型 → 分块器映射
 _CHUNKER_REGISTRY: dict[str, BaseChunker] = {
     "fallback": FallbackChunker(),
     "md": MarkdownChunker(),
+    "py": CodeChunker(),
+    "js": CodeChunker(),
+    "ts": CodeChunker(),
+    "java": CodeChunker(),
+    "c": CodeChunker(),
+    "cpp": CodeChunker(),
+    "h": CodeChunker(),
+    "go": CodeChunker(),
+    "rs": CodeChunker(),
+    "pdf": PDFChunker(),
     # 后续阶段注册：
-    # "pdf": PDFChunker(),
-    # "py": CodeChunker(),
-    # "js": CodeChunker(),
     # "xlsx": ExcelChunker(),
     # "xls": ExcelChunker(),
     # "docx": DocxChunker(),
