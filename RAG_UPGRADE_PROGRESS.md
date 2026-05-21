@@ -14,8 +14,8 @@
 | PDF 页面 + 字号检测切分器 | `backend/app/chunker.py` | ✅ |
 | Excel 工作表切分器 | `backend/app/chunker.py` | ✅ |
 | docx 标题样式切分器 | `backend/app/chunker.py` | ✅ |
-| 分块策略路由（按文件类型选择切分器） | `backend/app/chunker.py` | ⬜ |
-| 上下文继承逻辑（超限切片带父标题） | `backend/app/chunker.py` | ⬜ |
+| 分块策略路由（按文件类型选择切分器） | `backend/app/chunker.py` | ✅ |
+| 上下文继承逻辑（超限切片带父标题） | `backend/app/chunker.py` | ✅ |
 | `ai.py` 描述生成链路接入分块 | `backend/app/routers/ai.py` | ⬜ |
 | 验证：上传长文本文件 → 分块数 > 1，chunk 语义完整 | — | ⬜ |
 
