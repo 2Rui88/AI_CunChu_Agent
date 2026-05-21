@@ -14,6 +14,7 @@ import re
 import zipfile
 import fitz  # PyMuPDF
 import openpyxl
+from app.chunker import chunk_text, Chunk
 import numpy as np
 import httpx
 from fastapi import APIRouter
@@ -96,56 +97,66 @@ async def ai_describe(body: dict):
         if result.scalar() is None:
             return {"code": 1, "msg": "file not found or no permission"}
 
-        # 已有完成记录且非强制 → 直接返回
+        # 已有完成记录且非强制 → 直接返回（检查 chunk_index=0 即可）
         if not force:
             result = await db.execute(
                 select(UserFileAiDesc).where(
                     UserFileAiDesc.user == user,
                     UserFileAiDesc.md5 == md5_val,
+                    UserFileAiDesc.chunk_index == 0,
                     UserFileAiDesc.status == 1,
                 ).limit(1)
             )
             if result.scalar():
                 return {"code": 0, "msg": "already exists"}
 
-        # 全局缓存命中 → 复制到用户表
-        result = await db.execute(
-            select(FileAiDesc).where(
-                FileAiDesc.md5 == md5_val, FileAiDesc.status == 1
-            ).limit(1)
-        )
-        cache = result.scalar()
-        if cache and not force:
-            return await _copy_cache_to_user(db, user, md5_val, cache)
+        # 全局缓存命中 → 复制所有 chunk 到用户表
+        if not force:
+            result = await db.execute(
+                select(FileAiDesc).where(
+                    FileAiDesc.md5 == md5_val, FileAiDesc.status == 1
+                ).order_by(FileAiDesc.chunk_index)
+            )
+            caches = result.scalars().all()
+            if caches:
+                return await _copy_cache_to_user(db, user, md5_val, caches)
 
         # 生成描述
         description = await _generate_description(db, md5_val, filename, file_type, api_key)
         if not description:
             return {"code": 1, "msg": "describe failed"}
 
-        # 向量化
+        # 分块 + 逐块向量化 + 存储
+        chunks = chunk_text(file_type, description)
+        vecs: list[np.ndarray] = []
+
+        for ch in chunks:
+            try:
+                embedding = await get_embedding(api_key, ch.text)
+            except RuntimeError as exc:
+                return {"code": 1, "msg": f"embedding failed: {exc}"}
+
+            vec = np.array(embedding, dtype=np.float32)
+            vecs.append(vec)
+
+            # 写入全局缓存（带 chunk_index + context_label）
+            await _upsert_file_ai_desc(db, md5_val, ch.text, vec,
+                                       ch.index, ch.context_label)
+            # 写入用户记录
+            await _upsert_user_ai_desc(db, user, md5_val, ch.text, vec,
+                                       ch.index, ch.context_label)
+
+        # FAISS 逐块写入（commit 前，保证一致性）
         try:
-            embedding = await get_embedding(api_key, description)
-        except RuntimeError as exc:
-            return {"code": 1, "msg": f"embedding failed: {exc}"}
-
-        vec = np.array(embedding, dtype=np.float32)
-
-        # 写入全局缓存
-        await _upsert_file_ai_desc(db, md5_val, description, vec)
-        # 写入用户记录
-        await _upsert_user_ai_desc(db, user, md5_val, description, vec)
-
-        # FAISS 写入必须在 MySQL commit 之前，保证数据一致
-        try:
-            faiss_id = add_vector(user, vec)
-            await db.execute(
-                text(
-                    "UPDATE user_file_ai_desc SET faiss_id = :fid "
-                    "WHERE user = :user AND md5 = :md5"
-                ),
-                {"fid": faiss_id, "user": user, "md5": md5_val},
-            )
+            for i, ch in enumerate(chunks):
+                faiss_id = add_vector(user, vecs[i])
+                await db.execute(
+                    text(
+                        "UPDATE user_file_ai_desc SET faiss_id = :fid "
+                        "WHERE user = :user AND md5 = :md5 AND chunk_index = :cidx"
+                    ),
+                    {"fid": faiss_id, "user": user, "md5": md5_val, "cidx": ch.index},
+                )
             await db.commit()
         except Exception:
             return {"code": 1, "msg": "faiss write failed"}
@@ -482,50 +493,64 @@ def _build_internal_url(db_url: str) -> str:
     )
 
 
-async def _copy_cache_to_user(db, user: str, md5_val: str, cache) -> dict:
-    """从全局缓存 file_ai_desc 复制到用户表 user_file_ai_desc"""
-    if not cache.embedding:
-        return {"code": 1, "msg": "cache embedding is empty"}
+async def _copy_cache_to_user(db, user: str, md5_val: str, caches: list) -> dict:
+    """从全局缓存 file_ai_desc 复制所有 chunk 到用户表 user_file_ai_desc"""
+    for cache in caches:
+        if not cache.embedding:
+            continue
 
-    vec = np.frombuffer(cache.embedding, dtype=np.float32).copy()
-    await _upsert_user_ai_desc(db, user, md5_val, cache.description, vec)
+        vec = np.frombuffer(cache.embedding, dtype=np.float32).copy()
+        cidx = getattr(cache, "chunk_index", 0)
+        clabel = getattr(cache, "context_label", "")
 
-    # FAISS 写入必须在 MySQL commit 之前，保证两者一致
-    faiss_id = add_vector(user, vec)
-    await db.execute(
-        text(
-            "UPDATE user_file_ai_desc SET faiss_id = :fid "
-            "WHERE user = :user AND md5 = :md5"
-        ),
-        {"fid": faiss_id, "user": user, "md5": md5_val},
-    )
+        await _upsert_user_ai_desc(db, user, md5_val, cache.description,
+                                   vec, cidx, clabel)
+
+        faiss_id = add_vector(user, vec)
+        await db.execute(
+            text(
+                "UPDATE user_file_ai_desc SET faiss_id = :fid "
+                "WHERE user = :user AND md5 = :md5 AND chunk_index = :cidx"
+            ),
+            {"fid": faiss_id, "user": user, "md5": md5_val, "cidx": cidx},
+        )
+
     await db.commit()
     return {"code": 0, "msg": "ok"}
 
 
-async def _upsert_file_ai_desc(db, md5_val: str, description: str, vec: np.ndarray):
-    """写入或更新全局 AI 描述缓存"""
+async def _upsert_file_ai_desc(db, md5_val: str, description: str, vec: np.ndarray,
+                               chunk_index: int = 0, context_label: str = ""):
+    """写入或更新全局 AI 描述缓存（按 md5 + chunk_index 唯一）"""
     result = await db.execute(
-        select(FileAiDesc).where(FileAiDesc.md5 == md5_val).limit(1)
+        select(FileAiDesc).where(
+            FileAiDesc.md5 == md5_val, FileAiDesc.chunk_index == chunk_index
+        ).limit(1)
     )
     existing = result.scalar()
     if existing:
         existing.description = description
         existing.embedding = vec.tobytes()
+        existing.context_label = context_label
         existing.model = settings.vl_model
         existing.status = 1
     else:
         db.add(FileAiDesc(
-            md5=md5_val, description=description,
-            embedding=vec.tobytes(), model=settings.vl_model, status=1,
+            md5=md5_val, chunk_index=chunk_index,
+            description=description, embedding=vec.tobytes(),
+            context_label=context_label, model=settings.vl_model, status=1,
         ))
 
 
-async def _upsert_user_ai_desc(db, user: str, md5_val: str, description: str, vec: np.ndarray | None):
-    """写入或更新用户 AI 描述记录"""
+async def _upsert_user_ai_desc(db, user: str, md5_val: str, description: str,
+                                vec: np.ndarray | None, chunk_index: int = 0,
+                                context_label: str = ""):
+    """写入或更新用户 AI 描述记录（按 user + md5 + chunk_index 唯一）"""
     result = await db.execute(
         select(UserFileAiDesc).where(
-            UserFileAiDesc.user == user, UserFileAiDesc.md5 == md5_val
+            UserFileAiDesc.user == user,
+            UserFileAiDesc.md5 == md5_val,
+            UserFileAiDesc.chunk_index == chunk_index,
         ).limit(1)
     )
     existing = result.scalar()
@@ -533,12 +558,14 @@ async def _upsert_user_ai_desc(db, user: str, md5_val: str, description: str, ve
         existing.description = description
         if vec is not None:
             existing.embedding = vec.tobytes()
+        existing.context_label = context_label
         existing.status = 1
     else:
         db.add(UserFileAiDesc(
-            user=user, md5=md5_val, description=description,
+            user=user, md5=md5_val, chunk_index=chunk_index,
+            description=description,
             embedding=vec.tobytes() if vec is not None else None,
-            status=1,
+            context_label=context_label, status=1,
         ))
 
 

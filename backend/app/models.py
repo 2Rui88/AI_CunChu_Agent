@@ -80,13 +80,18 @@ class FileAiDesc(Base):
     __tablename__ = "file_ai_desc"
 
     id = Column(BigInteger, primary_key=True, autoincrement=True)
-    md5 = Column(String(256), unique=True, nullable=False)
+    md5 = Column(String(256), nullable=False)
+    chunk_index = Column(Integer, default=0, comment="切片序号，0 表示未分块")
     description = Column(Text, nullable=False)
     embedding = Column(MEDIUMBLOB)
     faiss_id = Column(Integer, default=-1)
+    context_label = Column(String(256), default="", comment="切片上下文标签")
     model = Column(String(64), default="")
     status = Column(SmallInteger, default=0)
     create_time = Column(TIMESTAMP, server_default=text("CURRENT_TIMESTAMP"))
+    __table_args__ = (
+        UniqueConstraint("md5", "chunk_index", name="uq_md5_chunk"),
+    )
 
 
 class UserFileAiDesc(Base):
@@ -95,13 +100,15 @@ class UserFileAiDesc(Base):
     id = Column(BigInteger, primary_key=True, autoincrement=True)
     user = Column(String(32), nullable=False)
     md5 = Column(String(256), nullable=False)
+    chunk_index = Column(Integer, default=0, comment="切片序号，0 表示未分块")
     cache_id = Column(BigInteger)
     description = Column(Text, nullable=False)
     embedding = Column(MEDIUMBLOB)
     faiss_id = Column(Integer, default=-1)
+    context_label = Column(String(256), default="", comment="切片上下文标签")
     model = Column(String(64), default="")
     status = Column(SmallInteger, default=0)
     create_time = Column(TIMESTAMP, server_default=text("CURRENT_TIMESTAMP"))
     __table_args__ = (
-        UniqueConstraint("user", "md5", name="uq_user_md5"),
+        UniqueConstraint("user", "md5", "chunk_index", name="uq_user_md5_chunk"),
     )
