@@ -535,7 +535,8 @@ def get_chunker(file_type: str) -> BaseChunker:
 
 
 def chunk_text(file_type: str, text: str,
-               max_chars: int | None = None) -> list[Chunk]:
+               max_chars: int | None = None,
+               metadata: dict | None = None) -> list[Chunk]:
     if max_chars is None:
         max_chars = settings.embedding_max_chars
     if not text or not text.strip():
@@ -543,7 +544,7 @@ def chunk_text(file_type: str, text: str,
 
     chunker = get_chunker(file_type)
     try:
-        chunks = chunker.chunk(text, max_chars)
+        chunks = chunker.chunk(text, max_chars, metadata=metadata)
         if not chunks:
             return [Chunk(index=0, text=text, context_label="")]
         return chunks

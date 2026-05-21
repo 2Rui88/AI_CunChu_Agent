@@ -121,13 +121,13 @@ async def ai_describe(body: dict):
             if caches:
                 return await _copy_cache_to_user(db, user, md5_val, caches)
 
-        # 生成描述
-        description = await _generate_description(db, md5_val, filename, file_type, api_key)
+        # 生成描述（返回描述文本 + 结构化 metadata 供分块器使用）
+        description, metadata = await _generate_description(db, md5_val, filename, file_type, api_key)
         if not description:
             return {"code": 1, "msg": "describe failed"}
 
-        # 分块 + 逐块向量化 + 存储
-        chunks = chunk_text(file_type, description)
+        # 分块 + 逐块向量化 + 存储（传入 metadata 供 PDF/Excel 切分器使用）
+        chunks = chunk_text(file_type, description, metadata=metadata)
         vecs: list[np.ndarray] = []
 
         for ch in chunks:
@@ -164,13 +164,11 @@ async def ai_describe(body: dict):
     return {"code": 0, "msg": "ok"}
 
 
-async def _generate_description(db, md5_val: str, filename: str, file_type: str, api_key: str) -> str:
+async def _generate_description(db, md5_val: str, filename: str, file_type: str,
+                                api_key: str) -> tuple[str, dict | None]:
     """
-    按文件类型生成中文描述：
-      - 图片 → Qwen-VL 多模态描述
-      - 文本类 → 下载后读取文本内容
-      - docx → 解压提取 word/document.xml 中的文本
-      - 其他 → 类型 + 文件名拼接
+    按文件类型生成中文描述，返回 (描述文本, 结构化metadata)。
+    metadata 供 chunker 使用（PDF 页面列表、Excel 工作表行等）。
     """
     ft = file_type.lower()
 
@@ -183,10 +181,10 @@ async def _generate_description(db, md5_val: str, filename: str, file_type: str,
         if fi and fi.url:
             public_url = _build_public_url(fi.url)
             desc = await describe_image(api_key, public_url)
-            return desc
-        return f"图片文件：{filename}"
+            return desc, None
+        return f"图片文件：{filename}", None
 
-    # ── PDF：下载二进制后提取文本 ──
+    # ── PDF：返回页面列表 + 格式化描述 ──
     if ft == "pdf":
         result = await db.execute(
             select(FileInfo).where(FileInfo.md5 == md5_val).limit(1)
@@ -194,12 +192,12 @@ async def _generate_description(db, md5_val: str, filename: str, file_type: str,
         fi = result.scalar()
         if fi and fi.url:
             internal_url = _build_internal_url(fi.url)
-            content = await _download_and_extract_pdf(internal_url, filename)
-            if content:
-                return content
-        return f"PDF文件：{filename}"
+            desc, meta = await _download_and_extract_pdf(internal_url, filename)
+            if desc:
+                return desc, meta
+        return f"PDF文件：{filename}", None
 
-    # ── Excel (xlsx)：下载二进制后解析表格文本 ──
+    # ── Excel：返回 sheet 行数据 + 格式化描述 ──
     if ft in ("xlsx", "xls"):
         result = await db.execute(
             select(FileInfo).where(FileInfo.md5 == md5_val).limit(1)
@@ -207,10 +205,10 @@ async def _generate_description(db, md5_val: str, filename: str, file_type: str,
         fi = result.scalar()
         if fi and fi.url:
             internal_url = _build_internal_url(fi.url)
-            content = await _download_and_extract_xlsx(internal_url, filename)
-            if content:
-                return content
-        return f"Excel文件：{filename}"
+            desc, meta = await _download_and_extract_xlsx(internal_url, filename)
+            if desc:
+                return desc, meta
+        return f"Excel文件：{filename}", None
 
     # ── 文本类 / docx：下载文件提取内容 ──
     if ft in _TEXT_TYPES or ft == "docx":
@@ -222,10 +220,10 @@ async def _generate_description(db, md5_val: str, filename: str, file_type: str,
             internal_url = _build_internal_url(fi.url)
             content = await _download_and_extract(internal_url, ft)
             if content:
-                return _format_text_description(filename, content)
+                return _format_text_description(filename, content), None
 
     # ── 其他：类型 + 文件名 ──
-    return f"{file_type or '未知'}类型的文件：{filename}"
+    return f"{file_type or '未知'}类型的文件：{filename}", None
 
 
 # ── 支持的文件类型 ──
@@ -300,94 +298,90 @@ def _format_text_description(filename: str, content: str) -> str:
 
 # ── PDF 文本提取 ──
 
-async def _download_and_extract_pdf(file_url: str, filename: str) -> str | None:
-    """下载 PDF 二进制并提取文本，返回格式化后的描述"""
+async def _download_and_extract_pdf(file_url: str, filename: str) -> tuple[str | None, dict | None]:
+    """下载 PDF 二进制并提取文本，返回 (描述, {pages, font_sizes})"""
     try:
         async with httpx.AsyncClient(timeout=30) as client:
             resp = await client.get(file_url)
             if resp.status_code != 200:
-                return None
+                return None, None
             data = resp.content
     except Exception:
-        return None
-
+        return None, None
     return _extract_pdf_text(data, filename)
 
 
-def _extract_pdf_text(data: bytes, filename: str) -> str:
+def _extract_pdf_text(data: bytes, filename: str) -> tuple[str, dict]:
     """
     从 PDF 二进制数据提取文本。
-    处理：空 PDF、加密 PDF、扫描型 PDF、超大 PDF 截断。
-    返回格式化的描述文本。
+    返回 (描述文本, {"pages": [page_text, ...], "font_sizes": [size, ...]})。
     """
+    meta: dict = {"pages": [], "font_sizes": []}
     if not data or len(data) == 0:
-        return f"PDF文件（空文件）：{filename}"
-
-    # 打开 PDF
+        return f"PDF文件（空文件）：{filename}", meta
     try:
         doc = fitz.open(stream=data, filetype="pdf")
     except Exception:
-        return f"PDF文件：{filename}"
-
-    # 加密检测
+        return f"PDF文件：{filename}", meta
     if doc.is_encrypted:
         doc.close()
-        return f"PDF文件（已加密，无法提取文本）：{filename}"
-
+        return f"PDF文件（已加密，无法提取文本）：{filename}", meta
     total = doc.page_count
     if total == 0:
         doc.close()
-        return f"PDF文件（无页面）：{filename}"
+        return f"PDF文件（无页面）：{filename}", meta
 
     max_chars = settings.pdf_max_extract_chars
-
-    # 逐页提取
     text_parts: list[str] = []
     scanned = 0
     for i in range(total):
         try:
             page = doc.load_page(i)
         except Exception:
-            continue
+            meta["pages"].append(""); meta["font_sizes"].append(0); continue
 
         page_text = page.get_text("text").strip() if page else ""
-        if not page_text:
-            # 检测扫描页（有图片无文本）
-            try:
-                imgs = page.get_images()
-            except Exception:
-                imgs = []
-            if imgs:
-                scanned += 1
-            continue
+        meta["pages"].append(page_text)
+        # 提取字号用于突变检测
+        try:
+            blocks = page.get_text("dict").get("blocks", [])
+            fs = 0
+            for b in blocks:
+                if b.get("type") == 0:
+                    for ln in b.get("lines", []):
+                        for sp in ln.get("spans", []):
+                            fs = round(sp.get("size", 0)); break
+                        if fs: break
+                if fs: break
+            meta["font_sizes"].append(fs)
+        except Exception:
+            meta["font_sizes"].append(0)
 
+        if not page_text:
+            try:
+                if page.get_images(): scanned += 1
+            except Exception:
+                pass
+            continue
         text_parts.append(page_text)
         if sum(len(t) for t in text_parts) > max_chars * 2:
             break
-
     doc.close()
 
-    # 无文本
     if not text_parts:
         if scanned > 0:
-            return f"PDF文件（疑似扫描型，{scanned}/{total} 页无文本）：{filename}"
-        return f"PDF文件（无可提取文本）：{filename}"
+            return f"PDF文件（疑似扫描型，{scanned}/{total} 页无文本）：{filename}", meta
+        return f"PDF文件（无可提取文本）：{filename}", meta
 
-    # 拼接 + 清洗 + 截断
     raw = "\n".join(text_parts)
     raw = _clean_pdf_text(raw)
-
     if len(raw) > max_chars:
         raw = raw[:max_chars]
         last_period = raw.rfind("。")
         if last_period > max_chars // 2:
             raw = raw[:last_period + 1]
-
-    note = ""
-    if scanned > 0:
-        note = f"（注：{scanned}/{total} 页为扫描页，已跳过）\n"
-
-    return f"文件名：{filename}\n{note}PDF内容：{raw}"
+    note = f"（注：{scanned}/{total} 页为扫描页，已跳过）\n" if scanned > 0 else ""
+    return f"文件名：{filename}\n{note}PDF内容：{raw}", meta
 
 
 def _clean_pdf_text(text: str) -> str:
@@ -401,34 +395,33 @@ def _clean_pdf_text(text: str) -> str:
 
 # ── Excel 表格提取 ──
 
-async def _download_and_extract_xlsx(file_url: str, filename: str) -> str | None:
-    """下载 Excel 二进制并提取文本，返回格式化后的描述"""
+async def _download_and_extract_xlsx(file_url: str, filename: str) -> tuple[str | None, dict | None]:
+    """下载 Excel 二进制并提取文本，返回 (描述, {sheets: [{name, rows}]})"""
     try:
         async with httpx.AsyncClient(timeout=30) as client:
             resp = await client.get(file_url)
             if resp.status_code != 200:
-                return None
+                return None, None
             data = resp.content
     except Exception:
-        return None
-
+        return None, None
     return _extract_xlsx_text(data, filename)
 
 
-def _extract_xlsx_text(data: bytes, filename: str) -> str:
+def _extract_xlsx_text(data: bytes, filename: str) -> tuple[str, dict]:
     """
     从 Excel 二进制数据提取文本。
-    逐 sheet 遍历所有有数据的行，以制表符分隔单元格，拼接为可读文本。
+    返回 (描述文本, {"sheets": [{"name": ..., "rows": [[...], ...]}, ...]})。
     """
+    meta: dict = {"sheets": []}
     if not data or len(data) == 0:
-        return f"Excel文件（空文件）：{filename}"
-
+        return f"Excel文件（空文件）：{filename}", meta
     try:
         wb = openpyxl.load_workbook(io.BytesIO(data), read_only=True, data_only=True)
     except Exception:
-        return f"Excel文件（无法解析）：{filename}"
+        return f"Excel文件（无法解析）：{filename}", meta
 
-    max_chars = settings.pdf_max_extract_chars  # 复用同一截断配置
+    max_chars = settings.pdf_max_extract_chars
     parts: list[str] = []
     sheet_count = 0
     empty_sheets = 0
@@ -437,41 +430,37 @@ def _extract_xlsx_text(data: bytes, filename: str) -> str:
         ws = wb[name]
         sheet_count += 1
         sheet_parts = [f"【{name}】"]
-
+        sheet_rows: list[list[str]] = []
         row_count = 0
         for row in ws.iter_rows(values_only=True):
-            # 跳过全空行
             values = [str(v) if v is not None else "" for v in row]
             if not any(v for v in values):
                 continue
+            sheet_rows.append(values)
             sheet_parts.append("\t".join(values))
             row_count += 1
-            # 提前截断
             total = sum(len(p) for p in parts) + sum(len(p) for p in sheet_parts)
             if total > max_chars * 2:
                 break
-
+        meta["sheets"].append({"name": name, "rows": sheet_rows})
         if row_count == 0:
             empty_sheets += 1
         else:
             parts.extend(sheet_parts)
-
     wb.close()
 
     if not parts:
-        return f"Excel文件（{sheet_count} 个工作表均无数据）：{filename}"
+        return f"Excel文件（{sheet_count} 个工作表均无数据）：{filename}", meta
 
     raw = "\n".join(parts)
-    raw = _clean_pdf_text(raw)  # 复用清洗逻辑
-
+    raw = _clean_pdf_text(raw)
     if len(raw) > max_chars:
         raw = raw[:max_chars]
         last_line = raw.rfind("\n")
         if last_line > max_chars // 2:
             raw = raw[:last_line]
-
     note = f"（共 {sheet_count} 个工作表）\n" if sheet_count > 1 else ""
-    return f"文件名：{filename}\n{note}表格内容：\n{raw}"
+    return f"文件名：{filename}\n{note}表格内容：\n{raw}", meta
 
 
 def _build_internal_url(db_url: str) -> str:
