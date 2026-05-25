@@ -25,15 +25,15 @@
 
 | 项 | 文件 | 状态 |
 |----|------|------|
-| `user_file_ai_desc` 添加 `chunk_index` 字段（默认 0） | `backend/app/models.py` | ⬜ |
-| `user_file_ai_desc` 添加 `context_label` 字段 | `backend/app/models.py` | ⬜ |
-| `(user, md5, chunk_index)` 联合唯一约束 | `backend/app/models.py` | ⬜ |
-| `file_ai_desc` 按 `(md5, chunk_index)` 调整全局缓存结构 | `backend/app/models.py` | ⬜ |
-| 数据库 DDL 迁移脚本 | `docker/mysql/migration.sql` | ⬜ |
-| 写入链路适配 chunk_index（INSERT 时带序号） | `backend/app/routers/ai.py` | ⬜ |
-| 全局缓存复制逻辑适配（copy_cache → 按 md5 复制所有 chunk） | `backend/app/routers/ai.py` | ⬜ |
-| FAISS add_vector 适配（每个 chunk 独立 faiss_id） | `backend/app/faiss_service.py` | ⬜ |
-| 验证：上传长文件 → MySQL 中 chunk_index 正确递增 | — | ⬜ |
+| `user_file_ai_desc` 添加 `chunk_index` 字段（默认 0） | `backend/app/models.py` | ✅ |
+| `user_file_ai_desc` 添加 `context_label` 字段 | `backend/app/models.py` | ✅ |
+| `(user, md5, chunk_index)` 联合唯一约束 | `backend/app/models.py` | ✅ |
+| `file_ai_desc` 按 `(md5, chunk_index)` 调整全局缓存结构 | `backend/app/models.py` | ✅ |
+| 数据库 DDL 迁移脚本 | `docker/mysql/migration_chunk.sql` | ✅ |
+| 写入链路适配 chunk_index（INSERT 时带序号） | `backend/app/routers/ai.py` | ✅ |
+| 全局缓存复制逻辑适配（copy_cache → 按 md5 复制所有 chunk） | `backend/app/routers/ai.py` | ✅ |
+| FAISS add_vector 适配（每个 chunk 独立 faiss_id） | `backend/app/faiss_service.py` | ✅ |
+| 验证：上传长文件 → MySQL 中 chunk_index 正确递增 | — | ✅ |
 
 ---
 
