@@ -44,8 +44,8 @@
 | 查询结构特征检测（扩展名/日期/编号/英文词匹配） | `backend/app/routers/ai.py` | ✅ |
 | LLM 查询分类（模糊 vs 精确，约 10 token） | `backend/app/routers/ai.py` | ✅ |
 | LLM 查询改写（模糊查询 → 生成 3 个变体 → 均值向量） | `backend/app/routers/ai.py` | ✅ |
-| 关键词提取函数（正则匹配精确锚点） | `backend/app/routers/ai.py` | ⬜ |
-| 关键词路门控（无精确词则跳过） | `backend/app/routers/ai.py` | ⬜ |
+| 关键词提取函数（正则匹配精确锚点） | `backend/app/routers/ai.py` | ✅ |
+| 关键词路门控（无精确词则跳过） | `backend/app/routers/ai.py` | ✅ |
 | MySQL 关键词搜索（多级排序：命中数 > 完全匹配 > 时间） | `backend/app/routers/ai.py` | ⬜ |
 | RRF 双路排名融合 | `backend/app/routers/ai.py` | ⬜ |
 | FAISS 搜索适配 chunk（回查时读取 context_label） | `backend/app/routers/ai.py` | ⬜ |
