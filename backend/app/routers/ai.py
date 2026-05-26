@@ -23,7 +23,7 @@ from app.database import Session
 from app.models import FileInfo, UserFileList, FileAiDesc, UserFileAiDesc
 from app.dependencies import check_token
 from app.config import settings
-from app.dashscope_client import describe_image, get_embedding
+from app.dashscope_client import describe_image, get_embedding, create_client
 from app.faiss_service import (
     search as faiss_search,
     add_vector,
@@ -600,6 +600,101 @@ async def _auto_rebuild_if_dirty(user: str):
         release_lock(lock_fd)
 
 
+# ═══════════════════════════════════════════════════════════
+#  查询预处理 —— 特征检测 / 分类 / 改写
+# ═══════════════════════════════════════════════════════════
+
+# 精确锚点正则（扩展名、日期、编号、英文词）
+_RE_PRECISE = re.compile(
+    r"\.\w{2,5}$"              # 扩展名 .pdf .xlsx
+    r"|\d{4}[年\-]\d{1,2}"     # 日期 2024-03 / 2024年3
+    r"|[Qq]\d"                 # 季度 Q1 Q3
+    r"|v\d+\.\d+"              # 版本 v2.0 v3.1
+    r"|#\d+"                   # 编号 #1024
+    r"|[a-zA-Z]{3,}"           # 英文词
+)
+# 模糊查询改写 prompt
+_REWRITE_PROMPT = (
+    "将以下自然语言查询改写为3个同义搜索短语，每行一个，只输出短语不要解释。\n"
+    "查询: {query}"
+)
+
+
+def _detect_query_features(query: str) -> dict:
+    """
+    零成本结构特征检测。
+    返回 {"is_precise": bool, "keywords": list[str]}。
+    命中扩展名/日期/编号等精确锚点时标记 is_precise=True。
+    """
+    keywords: list[str] = []
+    for m in _RE_PRECISE.finditer(query):
+        kw = m.group().strip()
+        if kw:
+            keywords.append(kw)
+    return {
+        "is_precise": len(keywords) > 0,
+        "keywords": keywords,
+    }
+
+
+async def _classify_query(query: str, api_key: str) -> str:
+    """
+    LLM 查询分类（约 10 token）。
+    返回 "模糊" 或 "精确"。
+    """
+    try:
+        client = create_client(api_key)
+        resp = await client.chat.completions.create(
+            model=settings.chat_model,
+            messages=[{
+                "role": "user",
+                "content": f"以下查询是模糊描述还是精确查找？只回答'模糊'或'精确'。\n查询: {query}",
+            }],
+            max_tokens=4,
+            temperature=0,
+        )
+        raw = resp.choices[0].message.content.strip()
+        return "精确" if "精确" in raw else "模糊"
+    except Exception:
+        return "模糊"
+
+
+async def _rewrite_and_embed(query: str, api_key: str) -> np.ndarray:
+    """
+    对模糊查询生成 3 个变体，分别 embedding，返回均值向量。
+    """
+    # 生成变体
+    try:
+        client = create_client(api_key)
+        resp = await client.chat.completions.create(
+            model=settings.chat_model,
+            messages=[{"role": "user", "content": _REWRITE_PROMPT.format(query=query)}],
+            max_tokens=100,
+            temperature=0.7,
+        )
+        variants = [v.strip() for v in resp.choices[0].message.content.strip().split("\n") if v.strip()]
+        if not variants:
+            variants = [query]
+    except Exception:
+        variants = [query]
+
+    # 分别 embedding 取均值
+    vecs = []
+    for v in variants[:3]:
+        try:
+            emb = await get_embedding(api_key, v)
+            vecs.append(np.array(emb, dtype=np.float32))
+        except Exception:
+            pass
+
+    if not vecs:
+        emb = await get_embedding(api_key, query)
+        return np.array(emb, dtype=np.float32)
+
+    avg = np.mean(vecs, axis=0)
+    return l2_normalize(avg)
+
+
 # ============================================================
 #  search —— AI 语义搜索
 # ============================================================
@@ -633,13 +728,24 @@ async def ai_search(body: dict):
     if get_ntotal(user) == 0:
         return {"code": 0, "count": 0, "files": []}
 
-    # 查询文本 → 向量 → L2 归一化 → FAISS 搜索
-    try:
-        embedding = await get_embedding(api_key, query)
-    except RuntimeError as exc:
-        return {"code": 1, "msg": f"embedding failed: {exc}"}
+    # ── 查询预处理：特征检测 → 分类 → 改写 ──
+    features = _detect_query_features(query)
 
-    query_vec = np.array(embedding, dtype=np.float32)
+    # 结构特征未命中时用 LLM 二次分类
+    if not features["is_precise"]:
+        qtype = await _classify_query(query, api_key)
+    else:
+        qtype = "精确"
+
+    # 模糊查询 → 改写 + 均值向量；精确查询 → 原始 embedding
+    if qtype == "模糊":
+        query_vec = await _rewrite_and_embed(query, api_key)
+    else:
+        try:
+            embedding = await get_embedding(api_key, query)
+        except RuntimeError as exc:
+            return {"code": 1, "msg": f"embedding failed: {exc}"}
+        query_vec = np.array(embedding, dtype=np.float32)
     try:
         results = faiss_search(user, query_vec, top_k)
     except Exception as exc:
