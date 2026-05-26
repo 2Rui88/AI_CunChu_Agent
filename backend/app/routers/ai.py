@@ -695,8 +695,59 @@ async def _rewrite_and_embed(query: str, api_key: str) -> np.ndarray:
     return l2_normalize(avg)
 
 
+def _extract_keywords(query: str) -> list[str]:
+    """
+    从查询中提取精确锚点关键词。
+    匹配扩展名(.pdf)、日期(2024-03)、版本号(v2.0)、编号(#1024)、英文词。
+    返回去重后的关键词列表。
+    """
+    seen = set()
+    keywords = []
+    for m in _RE_PRECISE.finditer(query):
+        kw = m.group().strip()
+        if kw and kw not in seen:
+            seen.add(kw)
+            keywords.append(kw)
+    return keywords
+
+
+async def _keyword_search(user: str, keywords: list[str], limit: int = 20) -> list[dict]:
+    """
+    MySQL 关键词模糊搜索。
+    多级排序：命中关键词数量 DESC → 文件名完全匹配优先 → 创建时间 DESC。
+    """
+    if not keywords:
+        return []
+
+    # 构建 WHERE user=? AND (file_name LIKE '%kw1%' OR ...)
+    like_parts = " OR ".join([f"ufl.file_name LIKE '%{kw}%'" for kw in keywords])
+    sql = (
+        f"SELECT ufl.md5, ufl.file_name, fi.url, fi.size, fi.type, ufl.pv, "
+        f"  ({' + '.join([f'(ufl.file_name LIKE \"%{kw}%\")' for kw in keywords])}) AS hit_count "
+        f"FROM user_file_list ufl "
+        f"JOIN file_info fi ON fi.md5 = ufl.md5 "
+        f"WHERE ufl.user = :user AND ({like_parts}) "
+        f"ORDER BY hit_count DESC, ufl.create_time DESC "
+        f"LIMIT :limit"
+    )
+    try:
+        async with Session() as db:
+            result = await db.execute(text(sql), {"user": user, "limit": limit})
+            rows = result.fetchall()
+            files = []
+            for row in rows:
+                files.append({
+                    "md5": row[0], "filename": row[1], "url": row[2],
+                    "size": str(row[3] or 0), "type": row[4], "pv": row[5],
+                    "hit_count": row[6], "source": "keyword",
+                })
+            return files
+    except Exception:
+        return []
+
+
 # ============================================================
-#  search —— AI 语义搜索
+#  search —— AI 语义搜索（含双路召回 + 去重合并）
 # ============================================================
 
 @router.post("/ai/search")
@@ -751,13 +802,18 @@ async def ai_search(body: dict):
     except Exception as exc:
         return {"code": 1, "msg": f"faiss search failed: {exc}"}
 
-    # faiss_id → MySQL 联表查询
+    # ── 关键词路（门控：无精确词则跳过）──
+    keywords = _extract_keywords(query)
+    kw_files = await _keyword_search(user, keywords, limit=top_k) if keywords else []
+
+    # ── faiss_id → MySQL 联表查询（向量路）──
     async with Session() as db:
         files = []
+        seen_md5: set[str] = set()
+
         for faiss_id, score in results:
             if score < SCORE_THRESHOLD:
                 continue
-
             result = await db.execute(
                 select(UserFileAiDesc, UserFileList, FileInfo)
                 .join(UserFileList,
@@ -781,7 +837,16 @@ async def ai_search(body: dict):
                     "size": str(fi.size),
                     "type": fi.type,
                     "score": round(score, 4),
+                    "source": "向量路",
                 })
+                seen_md5.add(uad.md5)
+
+        # ── 双路合并：关键词路结果去重追加 ──
+        for kf in kw_files:
+            if kf["md5"] not in seen_md5:
+                kf["score"] = 0.0  # 关键词路无向量分
+                files.append(kf)
+                seen_md5.add(kf["md5"])
 
         return {"code": 0, "count": len(files), "files": files}
 
