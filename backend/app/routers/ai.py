@@ -711,28 +711,44 @@ def _extract_keywords(query: str) -> list[str]:
     return keywords
 
 
-async def _keyword_search(user: str, keywords: list[str], limit: int = 20) -> list[dict]:
+async def _keyword_search(user: str, keywords: list[str], query: str = "",
+                           limit: int = 20) -> list[dict]:
     """
-    MySQL 关键词模糊搜索。
-    多级排序：命中关键词数量 DESC → 文件名完全匹配优先 → 创建时间 DESC。
+    MySQL 关键词模糊搜索，支持参数化查询防注入。
+    三级排序：命中关键词数量 DESC → 文件名完全匹配优先 → 创建时间 DESC。
     """
     if not keywords:
         return []
 
-    # 构建 WHERE user=? AND (file_name LIKE '%kw1%' OR ...)
-    like_parts = " OR ".join([f"ufl.file_name LIKE '%{kw}%'" for kw in keywords])
+    # 构建参数化 LIKE 条件
+    like_clauses = []
+    params: dict = {"user": user, "limit": limit}
+    for i, kw in enumerate(keywords):
+        key = f"kw{i}"
+        like_clauses.append(f"ufl.file_name LIKE :{key}")
+        params[key] = f"%{kw}%"
+
+    # 完全匹配条件：文件名包含原始查询字符串
+    exact_clause = "0"
+    if query:
+        params["exact_query"] = f"%{query}%"
+        exact_clause = "CASE WHEN ufl.file_name LIKE :exact_query THEN 1 ELSE 0 END"
+
+    # 命中计数
+    hit_parts = " + ".join([f"(ufl.file_name LIKE :kw{i})" for i in range(len(keywords))])
+
     sql = (
         f"SELECT ufl.md5, ufl.file_name, fi.url, fi.size, fi.type, ufl.pv, "
-        f"  ({' + '.join([f'(ufl.file_name LIKE \"%{kw}%\")' for kw in keywords])}) AS hit_count "
+        f"  ({hit_parts}) AS hit_count, {exact_clause} AS exact_match "
         f"FROM user_file_list ufl "
         f"JOIN file_info fi ON fi.md5 = ufl.md5 "
-        f"WHERE ufl.user = :user AND ({like_parts}) "
-        f"ORDER BY hit_count DESC, ufl.create_time DESC "
+        f"WHERE ufl.user = :user AND ({' OR '.join(like_clauses)}) "
+        f"ORDER BY hit_count DESC, exact_match DESC, ufl.create_time DESC "
         f"LIMIT :limit"
     )
     try:
         async with Session() as db:
-            result = await db.execute(text(sql), {"user": user, "limit": limit})
+            result = await db.execute(text(sql), params)
             rows = result.fetchall()
             files = []
             for row in rows:
@@ -804,7 +820,7 @@ async def ai_search(body: dict):
 
     # ── 关键词路（门控：无精确词则跳过）──
     keywords = _extract_keywords(query)
-    kw_files = await _keyword_search(user, keywords, limit=top_k) if keywords else []
+    kw_files = await _keyword_search(user, keywords, query=query, limit=top_k) if keywords else []
 
     # ── faiss_id → MySQL 联表查询（向量路）──
     async with Session() as db:
