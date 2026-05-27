@@ -47,11 +47,11 @@
 | 关键词提取函数（正则匹配精确锚点） | `backend/app/routers/ai.py` | ✅ |
 | 关键词路门控（无精确词则跳过） | `backend/app/routers/ai.py` | ✅ |
 | MySQL 关键词搜索（多级排序：命中数 > 完全匹配 > 时间） | `backend/app/routers/ai.py` | ✅ |
-| RRF 双路排名融合 | `backend/app/routers/ai.py` | ⬜ |
-| FAISS 搜索适配 chunk（回查时读取 context_label） | `backend/app/routers/ai.py` | ⬜ |
-| 按 md5 去重合并（同文件多 chunk 命中取最高分） | `backend/app/routers/ai.py` | ⬜ |
-| 结果增加 `match_context` 和 `source` 字段 | `backend/app/routers/ai.py` | ⬜ |
-| 验证：模糊查询 / 精确查询 / 混合查询三种场景结果正确 | — | ⬜ |
+| RRF 双路排名融合 | `backend/app/routers/ai.py` | ✅ |
+| FAISS 搜索适配 chunk（回查时读取 context_label） | `backend/app/routers/ai.py` | ✅ |
+| 按 md5 去重合并（同文件多 chunk 命中取最高分） | `backend/app/routers/ai.py` | ✅ |
+| 结果增加 `match_context` 和 `source` 字段 | `backend/app/routers/ai.py` | ✅ |
+| 验证：模糊查询 / 精确查询 / 混合查询三种场景结果正确 | — | ✅ |
 
 ---
 
