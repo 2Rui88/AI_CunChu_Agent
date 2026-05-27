@@ -822,12 +822,11 @@ async def ai_search(body: dict):
     keywords = _extract_keywords(query)
     kw_files = await _keyword_search(user, keywords, query=query, limit=top_k) if keywords else []
 
-    # ── faiss_id → MySQL 联表查询（向量路）──
+    # ── faiss_id → MySQL 联表查询（向量路，含 context_label）──
     async with Session() as db:
-        files = []
-        seen_md5: set[str] = set()
+        vec_ranked: dict[str, dict] = {}  # md5 → {file info, rank, vector_score}
 
-        for faiss_id, score in results:
+        for rank_i, (faiss_id, score) in enumerate(results):
             if score < SCORE_THRESHOLD:
                 continue
             result = await db.execute(
@@ -845,24 +844,53 @@ async def ai_search(body: dict):
             row = result.first()
             if row:
                 uad, ufl, fi = row
-                files.append({
-                    "md5": uad.md5,
-                    "filename": ufl.file_name,
-                    "description": uad.description,
-                    "url": fi.url,
-                    "size": str(fi.size),
-                    "type": fi.type,
-                    "score": round(score, 4),
-                    "source": "向量路",
-                })
-                seen_md5.add(uad.md5)
+                md5 = uad.md5
+                # 同 md5 多 chunk 命中：保留最高分的那个
+                if md5 not in vec_ranked or score > vec_ranked[md5]["score"]:
+                    vec_ranked[md5] = {
+                        "md5": md5,
+                        "filename": ufl.file_name,
+                        "description": uad.description,
+                        "url": fi.url, "size": str(fi.size), "type": fi.type,
+                        "score": round(score, 4),
+                        "rank": rank_i + 1,
+                        "match_context": uad.context_label or "",
+                        "chunk_index": uad.chunk_index,
+                    }
 
-        # ── 双路合并：关键词路结果去重追加 ──
-        for kf in kw_files:
-            if kf["md5"] not in seen_md5:
-                kf["score"] = 0.0  # 关键词路无向量分
-                files.append(kf)
-                seen_md5.add(kf["md5"])
+        # ── RRF 双路排名融合 ──
+        K = 60
+        rrf_scores: dict[str, float] = {}
+        file_map: dict[str, dict] = {}
+
+        # 向量路贡献
+        for md5, info in vec_ranked.items():
+            rrf_scores[md5] = 1.0 / (K + info["rank"])
+            info["source"] = "向量路"
+            file_map[md5] = info
+
+        # 关键词路贡献
+        for rank_j, kf in enumerate(kw_files):
+            md5 = kf["md5"]
+            kw_rrf = 1.0 / (K + rank_j + 1)
+            if md5 in rrf_scores:
+                rrf_scores[md5] += kw_rrf
+                file_map[md5]["source"] = "双路混合"
+            else:
+                rrf_scores[md5] = kw_rrf
+                kf["rank"] = rank_j + 1
+                kf["match_context"] = ""
+                kf["source"] = "关键词路"
+                kf["score"] = 0.0
+                file_map[md5] = kf
+
+        # RRF 降序排列
+        sorted_md5s = sorted(rrf_scores, key=lambda m: rrf_scores[m], reverse=True)
+        files = []
+        for md5 in sorted_md5s:
+            f = file_map[md5]
+            f["rrf_score"] = round(rrf_scores[md5], 5)
+            files.append(f)
 
         return {"code": 0, "count": len(files), "files": files}
 
