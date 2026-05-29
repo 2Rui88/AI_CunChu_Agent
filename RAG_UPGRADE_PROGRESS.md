@@ -59,9 +59,9 @@
 
 | 项 | 文件 | 状态 |
 |----|------|------|
-| 重排序 prompt 设计（候选列表 + query → 相关性排序） | `backend/app/routers/ai.py` | ⬜ |
-| LLM 重排序调用（Top-20 → Top-10） | `backend/app/routers/ai.py` | ⬜ |
-| 重排序失败的降级策略（回退到 RRF 排名） | `backend/app/routers/ai.py` | ⬜ |
+| 重排序 prompt 设计（候选列表 + query → 相关性排序） | `backend/app/routers/ai.py` | ✅ |
+| LLM 重排序调用（Top-20 → Top-10） | `backend/app/routers/ai.py` | ✅ |
+| 重排序失败的降级策略（回退到 RRF 排名） | `backend/app/routers/ai.py` | ✅ |
 | 验证：A/B 对比重排序前后 Top-5 准确率 | — | ⬜ |
 
 ---
