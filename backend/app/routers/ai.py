@@ -762,6 +762,67 @@ async def _keyword_search(user: str, keywords: list[str], query: str = "",
         return []
 
 
+# ── LLM 重排序 ──
+
+_RERANK_PROMPT = (
+    "给定用户查询和候选文件列表，按与查询的相关性从高到低排序。\n"
+    "只输出排名后的候选序号（从1开始），每行一个数字，不要解释。\n\n"
+    "查询: {query}\n\n候选文件:\n{candidates}"
+)
+
+
+async def _rerank_with_llm(query: str, files: list[dict], api_key: str) -> list[dict]:
+    """
+    LLM 重排序：将 RRF Top-20 发送给 LLM 精排，返回 Top-10。
+    失败时由调用方降级回退到 RRF 原始排名。
+    """
+    if len(files) <= 1:
+        return files
+
+    # 构建候选列表文本（最多 20 个）
+    candidates_text = ""
+    for i, f in enumerate(files[:20], 1):
+        desc = (f.get("description") or "")[:80].replace("\n", " ")
+        candidates_text += f"{i}. 文件名:{f['filename']} | 描述:{desc}\n"
+
+    prompt = _RERANK_PROMPT.format(query=query, candidates=candidates_text)
+
+    client = create_client(api_key)
+    resp = await client.chat.completions.create(
+        model=settings.chat_model,
+        messages=[{"role": "user", "content": prompt}],
+        max_tokens=80,
+        temperature=0,
+    )
+    raw = resp.choices[0].message.content.strip()
+
+    # 解析排序序号
+    indices = []
+    for line in raw.split("\n"):
+        try:
+            idx = int(line.strip().rstrip("."))
+            if 1 <= idx <= len(files):
+                indices.append(idx - 1)
+        except ValueError:
+            continue
+
+    if not indices:
+        return files[:10]  # 解析失败 → 取 RRF 前十
+
+    # 去重 + 补齐未出现的文件
+    seen = set()
+    result = []
+    for idx in indices:
+        if idx not in seen:
+            seen.add(idx)
+            result.append(files[idx])
+    for i, f in enumerate(files):
+        if i not in seen and len(result) < 10:
+            result.append(f)
+
+    return result[:10]
+
+
 # ============================================================
 #  search —— AI 语义搜索（含双路召回 + 去重合并）
 # ============================================================
@@ -891,6 +952,13 @@ async def ai_search(body: dict):
             f = file_map[md5]
             f["rrf_score"] = round(rrf_scores[md5], 5)
             files.append(f)
+
+        # ── LLM 重排序（Top-20 → Top-10）──
+        if len(files) > 1 and api_key:
+            try:
+                files = await _rerank_with_llm(query, files[:20], api_key)
+            except Exception:
+                pass  # 失败降级：保留 RRF 排名
 
         return {"code": 0, "count": len(files), "files": files}
 
