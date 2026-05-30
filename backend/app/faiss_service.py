@@ -141,6 +141,15 @@ def _dirty_path(username: str) -> str:
     return os.path.join(LOCK_DIR, f"{_user_hash(username)}.dirty")
 
 
+def mark_dirty(username: str):
+    """标记用户 FAISS 索引需要重建（文件删除后调用）"""
+    os.makedirs(LOCK_DIR, exist_ok=True)
+    path = _dirty_path(username)
+    if not os.path.exists(path):
+        with open(path, "w") as f:
+            f.write("1")
+
+
 def is_dirty(username: str) -> bool:
     """检查用户 FAISS 索引是否需要重建"""
     return os.path.exists(_dirty_path(username))

@@ -6,7 +6,6 @@ Redis Key:
   FILE_NAME_HASH     —— fileid -> filename 映射
   SHARE_PIC_COUNT_*  —— 用户图床数量
 """
-import os
 import hashlib
 import secrets
 from fastapi import APIRouter, Request
@@ -20,6 +19,7 @@ from app.models import (
 from app.dependencies import check_token
 from app.redis_client import redis
 from app.minio_client import client, BUCKET
+from app.faiss_service import mark_dirty
 
 router = APIRouter(prefix="/api", tags=["share"])
 
@@ -27,11 +27,6 @@ router = APIRouter(prefix="/api", tags=["share"])
 FILE_PUBLIC_ZSET = "FILE_PUBLIC_ZSET"
 FILE_NAME_HASH = "FILE_NAME_HASH"
 FILE_PUBLIC_COUNT = "FILE_PUBLIC_COUNT"
-
-
-def _md5_hex(text: str) -> str:
-    """计算文本的 MD5 十六进制字符串"""
-    return hashlib.md5(text.encode()).hexdigest()
 
 
 # ============================================================
@@ -182,11 +177,8 @@ async def _del_file(user: str, md5_val: str, filename: str) -> dict:
 
         await db.commit()
 
-    # 标记 FAISS 索引脏（下次搜索前自动重建）
-    os.makedirs("/tmp/faiss_locks", exist_ok=True)
-    dirty_path = f"/tmp/faiss_locks/{_md5_hex(user)}.dirty"
-    with open(dirty_path, "w") as f:
-        f.write("1")
+    # 标记 FAISS 需要重建（下次搜索自动触发）
+    mark_dirty(user)
 
     return {"code": 0}
 

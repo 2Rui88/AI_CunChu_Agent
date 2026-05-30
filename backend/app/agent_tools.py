@@ -10,8 +10,6 @@ Agent 工具集 —— 7 个文件操作工具，供 ReAct Agent Loop 调用
                get_storage_stats, describe_file
   DESTRUCTIVE: delete_file, share_file（需用户二次确认）
 """
-import os
-import hashlib
 import numpy as np
 from sqlalchemy import select, delete as sql_delete
 from app.database import Session
@@ -26,23 +24,12 @@ from app.faiss_service import (
     search as faiss_search,
     add_vector,
     l2_normalize, get_ntotal,
+    mark_dirty,
 )
 from app.minio_client import client as minio_client, BUCKET
 
 # ── 危险操作集合（Agent 确认门控用）──
 DESTRUCTIVE_TOOLS = {"delete_file", "share_file"}
-
-
-def _md5_hex(text: str) -> str:
-    """计算文本的 MD5 十六进制字符串"""
-    return hashlib.md5(text.encode()).hexdigest()
-
-
-def _mark_faiss_dirty(username: str):
-    """标记用户 FAISS 索引为脏（文件删除后触发）"""
-    os.makedirs("/tmp/faiss_locks", exist_ok=True)
-    with open(f"/tmp/faiss_locks/{_md5_hex(username)}.dirty", "w") as f:
-        f.write("1")
 
 
 def _get_suffix(filename: str) -> str:
@@ -366,7 +353,7 @@ async def tool_delete_file(username: str, **kwargs) -> dict:
 
     # 标记 FAISS 脏
     try:
-        _mark_faiss_dirty(username)
+        mark_dirty(username)
     except Exception:
         pass
 
