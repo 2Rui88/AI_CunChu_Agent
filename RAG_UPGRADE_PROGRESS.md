@@ -62,7 +62,7 @@
 | 重排序 prompt 设计（候选列表 + query → 相关性排序） | `backend/app/routers/ai.py` | ✅ |
 | LLM 重排序调用（Top-20 → Top-10） | `backend/app/routers/ai.py` | ✅ |
 | 重排序失败的降级策略（回退到 RRF 排名） | `backend/app/routers/ai.py` | ✅ |
-| 验证：A/B 对比重排序前后 Top-5 准确率 | — | ⬜ |
+| 验证：A/B 对比重排序前后 Top-5 准确率 | — | ✅ |
 
 ---
 
@@ -70,10 +70,10 @@
 
 | 项 | 文件 | 状态 |
 |----|------|------|
-| `is_dirty(user)` 检测函数 | `backend/app/faiss_service.py` | ⬜ |
-| `mark_dirty(user)` 标记函数 | `backend/app/faiss_service.py` | ⬜ |
-| `clear_dirty(user)` 清除函数 | `backend/app/faiss_service.py` | ⬜ |
-| 搜索前自动 rebuild（检测 dirty → 加锁 → 重建 → 清除） | `backend/app/routers/ai.py` | ⬜ |
+| `is_dirty(user)` 检测函数 | `backend/app/faiss_service.py` | ✅ |
+| `mark_dirty(user)` 标记函数 | `backend/app/faiss_service.py` | ✅ |
+| `clear_dirty(user)` 清除函数 | `backend/app/faiss_service.py` | ✅ |
+| 搜索前自动 rebuild（检测 dirty → 加锁 → 重建 → 清除） | `backend/app/routers/ai.py` | ✅ |
 | 文件锁（防止并发同时重建） | `backend/app/faiss_service.py` | ⬜ |
 | `rebuild_from_db` 适配分块（重建时按 chunk_index 回写） | `backend/app/faiss_service.py` | ⬜ |
 | `share.py` 删除接入 mark_dirty（替代旧标记逻辑） | `backend/app/routers/share.py` | ⬜ |
