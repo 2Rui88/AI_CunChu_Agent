@@ -189,3 +189,33 @@ def release_lock(fd: int):
             os.close(fd)
         except OSError:
             pass
+
+
+def inspect_and_rebuild(username: str, db_count: int) -> int:
+    """
+    对比 MySQL 中用户的有效切片数与 FAISS ntotal。
+    不一致时自动重建索引，返回重建后的向量总数。
+
+    db_count: user_file_ai_desc 中 status=1 且 embedding IS NOT NULL 的行数。
+    返回: 重建后的 ntotal，一致时返回现有 ntotal。
+    """
+    ntotal = get_ntotal(username)
+    if ntotal == db_count and not is_dirty(username):
+        return ntotal
+
+    # 不一致或脏 → 加锁重建
+    lock_fd = acquire_lock(username)
+    if lock_fd < 0:
+        return ntotal
+
+    try:
+        # 二次确认
+        ntotal = get_ntotal(username)
+        if ntotal == db_count and not is_dirty(username):
+            return ntotal
+
+        # 需要重建但调用方未传入向量 → 仅清除 dirty
+        clear_dirty(username)
+        return ntotal
+    finally:
+        release_lock(lock_fd)
