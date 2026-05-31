@@ -74,9 +74,9 @@
 | `mark_dirty(user)` 标记函数 | `backend/app/faiss_service.py` | ✅ |
 | `clear_dirty(user)` 清除函数 | `backend/app/faiss_service.py` | ✅ |
 | 搜索前自动 rebuild（检测 dirty → 加锁 → 重建 → 清除） | `backend/app/routers/ai.py` | ✅ |
-| 文件锁（防止并发同时重建） | `backend/app/faiss_service.py` | ⬜ |
-| `rebuild_from_db` 适配分块（重建时按 chunk_index 回写） | `backend/app/faiss_service.py` | ⬜ |
-| `share.py` 删除接入 mark_dirty（替代旧标记逻辑） | `backend/app/routers/share.py` | ⬜ |
+| 文件锁（防止并发同时重建） | `backend/app/faiss_service.py` | ✅ |
+| `rebuild_from_db` 适配分块（重建时按 chunk_index 回写） | `backend/app/faiss_service.py` | ✅ |
+| `share.py` 删除接入 mark_dirty（替代旧标记逻辑） | `backend/app/routers/share.py` | ✅ |
 | 定期巡检定时任务（对比 MySQL 切片数与 FAISS ntotal） | `backend/app/faiss_service.py` | ⬜ |
 | 验证：删除文件 → 下次搜索自动重建 → 已删文件不可搜到 | — | ⬜ |
 
