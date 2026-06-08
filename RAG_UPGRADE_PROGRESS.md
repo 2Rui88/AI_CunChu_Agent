@@ -86,8 +86,8 @@
 
 | 项 | 文件 | 状态 |
 |----|------|------|
-| `search_files` 工具结果压缩（只传前两句描述 + match_context） | `backend/app/agent_tools.py` | ⬜ |
-| 搜索结果附带文件 URL（引用溯源） | `backend/app/agent_tools.py` | ⬜ |
+| `search_files` 工具结果压缩（只传前两句描述 + match_context） | `backend/app/agent_tools.py` | ✅ |
+| 搜索结果附带文件 URL（引用溯源） | `backend/app/agent_tools.py` | ✅ |
 | Agent prompt 增加"引用信息时注明来源文件"规则 | `backend/app/routers/agent.py` | ⬜ |
 | 追问展开逻辑（用户追问时拉取全切片） | `backend/app/routers/agent.py` | ⬜ |
 | 验证：Agent 对话中搜索结果带来源链接，追问可展开 | — | ⬜ |
