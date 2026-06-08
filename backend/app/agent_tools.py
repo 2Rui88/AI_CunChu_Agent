@@ -10,6 +10,7 @@ Agent 工具集 —— 7 个文件操作工具，供 ReAct Agent Loop 调用
                get_storage_stats, describe_file
   DESTRUCTIVE: delete_file, share_file（需用户二次确认）
 """
+import re
 import numpy as np
 from sqlalchemy import select, delete as sql_delete
 from app.database import Session
@@ -30,6 +31,21 @@ from app.minio_client import client as minio_client, BUCKET
 
 # ── 危险操作集合（Agent 确认门控用）──
 DESTRUCTIVE_TOOLS = {"delete_file", "share_file"}
+
+
+def _compress_description(text: str) -> str:
+    """
+    压缩描述文本为前两句，减少 Agent LLM token 消耗。
+    句子分隔符：。！？!? \n
+    超过两句时以 "..." 结尾。
+    """
+    if not text:
+        return ""
+    sentences = re.split(r"[。！？!?\n]+", text)
+    sentences = [s.strip() for s in sentences if s.strip()]
+    if len(sentences) <= 2:
+        return text
+    return "。".join(sentences[:2]) + "。"
 
 
 def _get_suffix(filename: str) -> str:
@@ -90,14 +106,17 @@ async def tool_search_files(username: str, **kwargs) -> dict:
                 row = result.first()
                 if row:
                     uad, ufl, fi = row
+                    # 压缩描述：仅保留描述的前两句，减少 LLM token 消耗
+                    compressed = _compress_description(uad.description)
                     files.append({
                         "md5": uad.md5,
                         "filename": ufl.file_name,
-                        "description": uad.description,
-                        "url": fi.url,
+                        "description": compressed,
+                        "url": fi.url,                          # 引用溯源
                         "size": str(fi.size),
                         "type": fi.type,
                         "score": round(score, 4),
+                        "match_context": uad.context_label or "",  # 命中位置
                     })
     except Exception as exc:
         return {"error": f"database query failed: {exc}"}
