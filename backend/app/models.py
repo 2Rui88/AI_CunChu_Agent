@@ -12,8 +12,9 @@ class UserInfo(Base):
     id = Column(BigInteger, primary_key=True, autoincrement=True)
     user_name = Column(String(32), unique=True, nullable=False)
     nick_name = Column(String(32), unique=True, nullable=False)
-    password = Column(String(32), nullable=False)
-    salt = Column(String(32), nullable=False)
+    password = Column(String(128), nullable=False)  # bcrypt 哈希 60 字符；旧 MD5 为 32 字符
+    salt = Column(String(32), nullable=False)       # 仅旧算法使用，bcrypt 自带盐
+    algo = Column(String(16), default="md5", comment="密码算法: md5(旧)/bcrypt")
     phone = Column(String(16), default="")
     email = Column(String(64), default="")
     api_key = Column(String(256), default="")
