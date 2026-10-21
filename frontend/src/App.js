@@ -1,71 +1,114 @@
 import { useState } from 'react';
-import { BrowserRouter as Router, Routes, Route, Navigate } from 'react-router-dom';
-import { Layout } from 'antd';
-import styled from '@emotion/styled';
+import { BrowserRouter as Router, Routes, Route, Navigate, useLocation } from 'react-router-dom';
+import { ConfigProvider, Layout, Button } from 'antd';
+import { RobotOutlined } from '@ant-design/icons';
+import zhCN from 'antd/locale/zh_CN';
+import AppSidebar from './components/AppSidebar';
+import PageHeader from './components/PageHeader';
+import ChatPanel from './components/ChatPanel';
 import Login from './pages/Login';
 import Home from './pages/Home';
 import ImageList from './pages/ImageList';
 import FileList from './pages/FileList';
 import SharedFiles from './pages/SharedFiles';
 import TopDownloads from './pages/TopDownloads';
-import NavBar from './components/NavBar';
-import ChatPanel from './components/ChatPanel';
 import { AuthProvider, useAuth } from './contexts/AuthContext';
 
 const { Content } = Layout;
 
-const StyledLayout = styled(Layout)`
-  background: linear-gradient(135deg, rgba(200, 255, 200, 0.4), rgba(150, 255, 150, 0.2));
-  min-height: 100vh;
-`;
+const themeConfig = {
+  token: {
+    colorPrimary: '#2563eb',
+    colorLink: '#2563eb',
+    borderRadius: 10,
+    colorBgLayout: '#f5f7fa',
+    fontSize: 14,
+  },
+  components: {
+    Menu: {
+      itemBorderRadius: 10,
+      itemMarginInline: 4,
+      itemHeight: 44,
+    },
+    Card: {
+      paddingLG: 20,
+    },
+  },
+};
 
-const GlassContent = styled(Content)`
-  background: rgba(255, 255, 255, 0.25);
-  backdrop-filter: blur(10px);
-  border-radius: 16px;
-  border: 1px solid rgba(255, 255, 255, 0.3);
-  margin: 24px;
-  padding: 24px;
-  box-shadow: 0 4px 6px rgba(0, 0, 0, 0.1);
-`;
+const PAGE_META = {
+  '/': { title: '首页', desc: '上传文件后，用自然语言描述内容即可找到它们' },
+  '/files': { title: '文件管理', desc: '上传、下载、分享普通文件，大文件自动分片续传' },
+  '/images': { title: '图片库', desc: '图片上传与图床分享，AI 自动生成图片描述' },
+  '/shared': { title: '共享广场', desc: '其他用户分享的文件，可转存到自己的空间' },
+  '/top-downloads': { title: '下载排行', desc: '全站共享文件下载量 TOP 10' },
+};
 
 const PrivateRoute = ({ children }) => {
   const { user } = useAuth();
   return user ? children : <Navigate to="/login" replace />;
 };
 
-function AppRoutes() {
+function MainLayout() {
   const { user } = useAuth();
+  const location = useLocation();
   const [chatOpen, setChatOpen] = useState(false);
+  const meta = PAGE_META[location.pathname] || PAGE_META['/'];
 
   return (
-    <StyledLayout>
-      <NavBar
-        onChatToggle={() => setChatOpen((v) => !v)}
-        chatOpen={chatOpen}
-      />
-      <GlassContent>
-        <Routes>
-          <Route path="/login" element={user ? <Navigate to="/" replace /> : <Login />} />
-          <Route path="/" element={<PrivateRoute><Home /></PrivateRoute>} />
-          <Route path="/images" element={<PrivateRoute><ImageList /></PrivateRoute>} />
-          <Route path="/files" element={<PrivateRoute><FileList /></PrivateRoute>} />
-          <Route path="/shared" element={<PrivateRoute><SharedFiles /></PrivateRoute>} />
-          <Route path="/top-downloads" element={<PrivateRoute><TopDownloads /></PrivateRoute>} />
-        </Routes>
-      </GlassContent>
+    <Layout style={{ minHeight: '100vh' }}>
+      <AppSidebar />
+      <Layout>
+        <PageHeader
+          title={meta.title}
+          desc={meta.desc}
+          extra={user ? (
+            <Button
+              type={chatOpen ? 'default' : 'primary'}
+              icon={<RobotOutlined />}
+              onClick={() => setChatOpen((v) => !v)}
+            >
+              {chatOpen ? '收起助手' : 'AI 助手'}
+            </Button>
+          ) : null}
+        />
+        <Content style={{ padding: '24px 24px 40px' }}>
+          <div style={{ maxWidth: 1160, margin: '0 auto' }}>
+            <Routes>
+              <Route path="/" element={<PrivateRoute><Home /></PrivateRoute>} />
+              <Route path="/files" element={<PrivateRoute><FileList /></PrivateRoute>} />
+              <Route path="/images" element={<PrivateRoute><ImageList /></PrivateRoute>} />
+              <Route path="/shared" element={<PrivateRoute><SharedFiles /></PrivateRoute>} />
+              <Route path="/top-downloads" element={<PrivateRoute><TopDownloads /></PrivateRoute>} />
+              <Route path="*" element={<Navigate to="/" replace />} />
+            </Routes>
+          </div>
+        </Content>
+      </Layout>
       {user && <ChatPanel open={chatOpen} onClose={() => setChatOpen(false)} />}
-    </StyledLayout>
+    </Layout>
   );
+}
+
+function AppRoutes() {
+  const { user } = useAuth();
+  const location = useLocation();
+
+  if (location.pathname === '/login') {
+    return user ? <Navigate to="/" replace /> : <Login />;
+  }
+  return <MainLayout />;
 }
 
 function App() {
   return (
-    <AuthProvider>
-      <Router>
-        <AppRoutes />
-      </Router>
-    </AuthProvider>
+    <ConfigProvider locale={zhCN} theme={themeConfig}>
+      <AuthProvider>
+        <Router>
+          <AppRoutes />
+        </Router>
+      </AuthProvider>
+    </ConfigProvider>
   );
 }
 

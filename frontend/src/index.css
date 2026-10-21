@@ -1,0 +1,28 @@
+body {
+  margin: 0;
+  font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto,
+    'Helvetica Neue', Arial, 'PingFang SC', 'Hiragino Sans GB', 'Microsoft YaHei', sans-serif;
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+  background: #f5f7fa;
+}
+
+#root {
+  min-height: 100vh;
+}
+
+/* 细滚动条，贴近主流桌面应用观感 */
+::-webkit-scrollbar {
+  width: 8px;
+  height: 8px;
+}
+::-webkit-scrollbar-thumb {
+  background: #d4d9e0;
+  border-radius: 4px;
+}
+::-webkit-scrollbar-thumb:hover {
+  background: #b8c0cb;
+}
+::-webkit-scrollbar-track {
+  background: transparent;
+}
