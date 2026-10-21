@@ -3,6 +3,8 @@ services:
     image: mysql:8.0
     container_name: tc_mysql
     restart: unless-stopped
+    # 服务端默认字符集设为 utf8mb4，保证中文文件名/描述正常存储
+    command: --character-set-server=utf8mb4 --collation-server=utf8mb4_unicode_ci
     ports:
       - "3307:3306"
     volumes:
@@ -39,7 +41,8 @@ services:
     restart: unless-stopped
     command: server /data --console-address ":9001"
     ports:
-      - "9001:9001"
+      # 控制台仅绑定本机回环，不再暴露公网（桶已私有化，管理面不需要对外）
+      - "127.0.0.1:9001:9001"
     volumes:
       - minio_data:/data
     environment:
