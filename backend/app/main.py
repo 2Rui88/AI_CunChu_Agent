@@ -1,11 +1,23 @@
+import logging
 from contextlib import asynccontextmanager
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from app.routers import auth, files, chunk, share, ai, agent
+from app.database import init_db
+from app.minio_client import ensure_bucket
+
+logger = logging.getLogger("uvicorn.error")
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    # 启动时确保表和存储桶存在（create_all / bucket_exists 均为幂等操作）
+    try:
+        await init_db()
+        ensure_bucket()
+    except Exception as exc:
+        logger.error("startup init failed: %s", exc)
+        raise
     yield
 
 
