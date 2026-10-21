@@ -32,7 +32,6 @@ from app.faiss_service import (
     get_ntotal,
     load_index,
     is_dirty, clear_dirty,
-    acquire_lock, release_lock,
 )
 
 router = APIRouter(prefix="/api", tags=["ai"])
@@ -562,42 +561,36 @@ async def _auto_rebuild_if_dirty(user: str):
     """
     脏标记检测 + 自动重建 FAISS 索引。
     文件删除后，dealfile 端点会创建 .dirty 文件，搜索前此处自动重建。
-    使用文件锁防止并发搜索触发多次重建。
+    注意：文件锁在 rebuild_from_db 内部获取（与 add_vector 互斥），
+    此处不再外层加锁——flock 跨 fd 不可重入，外层持锁再进 rebuild 会死锁。
+    并发触发时最多重复一次幂等重建（数据源相同），不会写坏索引。
     """
-    lock_fd = acquire_lock(user)
-    if lock_fd < 0:
-        return  # 加锁失败，放弃本次重建
+    if not is_dirty(user):
+        return
 
-    try:
-        # 二次确认（加锁后其他人可能已清理）
-        if not is_dirty(user):
-            return
+    async with Session() as db:
+        result = await db.execute(
+            select(UserFileAiDesc).where(
+                UserFileAiDesc.user == user,
+                UserFileAiDesc.status == 1,
+                UserFileAiDesc.embedding.isnot(None),
+            ).order_by(UserFileAiDesc.id)
+        )
+        rows = result.scalars().all()
 
-        async with Session() as db:
-            result = await db.execute(
-                select(UserFileAiDesc).where(
-                    UserFileAiDesc.user == user,
-                    UserFileAiDesc.status == 1,
-                    UserFileAiDesc.embedding.isnot(None),
-                ).order_by(UserFileAiDesc.id)
-            )
-            rows = result.scalars().all()
+        if not rows:
+            rebuild_from_db(user, [])
+        else:
+            vectors = [np.frombuffer(r.embedding, dtype=np.float32) for r in rows]
+            rebuild_from_db(user, vectors)
+            # 回写 faiss_id
+            idx = load_index(user)
+            for i, r in enumerate(rows):
+                if i < idx.ntotal:
+                    r.faiss_id = i
+            await db.commit()
 
-            if not rows:
-                rebuild_from_db(user, [])
-            else:
-                vectors = [np.frombuffer(r.embedding, dtype=np.float32) for r in rows]
-                rebuild_from_db(user, vectors)
-                # 回写 faiss_id
-                idx = load_index(user)
-                for i, r in enumerate(rows):
-                    if i < idx.ntotal:
-                        r.faiss_id = i
-                await db.commit()
-
-        clear_dirty(user)
-    finally:
-        release_lock(lock_fd)
+    clear_dirty(user)
 
 
 # ═══════════════════════════════════════════════════════════

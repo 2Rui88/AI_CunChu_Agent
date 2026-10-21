@@ -51,22 +51,33 @@ def load_index(username: str, dim: int | None = None) -> faiss.IndexFlatIP:
 
 
 def save_index(username: str, index: faiss.IndexFlatIP):
-    """将索引持久化到磁盘"""
+    """将索引持久化到磁盘（先写临时文件再原子替换，避免并发搜索读到写一半的索引）"""
     Path(settings.faiss_user_index_dir).mkdir(parents=True, exist_ok=True)
-    faiss.write_index(index, _index_path(username))
+    path = _index_path(username)
+    tmp_path = f"{path}.tmp.{os.getpid()}"
+    faiss.write_index(index, tmp_path)
+    os.replace(tmp_path, path)
 
 
 def add_vector(username: str, vec: np.ndarray) -> int:
     """
     向用户索引中追加一个向量，返回分配的 faiss_id（添加前的 ntotal）。
+    整个"读盘→追加→写盘"持用户级文件锁执行：gunicorn 多 worker 并发写入时
+    串行化，防止两个请求读到相同 ntotal 而分配重复 faiss_id、相互覆盖。
     向量添加前先做 L2 归一化，添加后自动保存索引到磁盘。
     """
     vec = l2_normalize(vec)
-    idx = load_index(username)
-    faiss_id = int(idx.ntotal)
-    idx.add(vec.reshape(1, -1).astype(np.float32))
-    save_index(username, idx)
-    return faiss_id
+    lock_fd = acquire_lock(username)
+    if lock_fd < 0:
+        raise RuntimeError("faiss index lock busy")
+    try:
+        idx = load_index(username)
+        faiss_id = int(idx.ntotal)
+        idx.add(vec.reshape(1, -1).astype(np.float32))
+        save_index(username, idx)
+        return faiss_id
+    finally:
+        release_lock(lock_fd)
 
 
 def search(
@@ -100,13 +111,20 @@ def search(
 def rebuild_from_db(username: str, vectors: list[np.ndarray]):
     """
     从数据库中的向量列表全量重建用户索引（用于 rebuild 场景）。
+    持文件锁执行，与 add_vector 互斥（锁不可重入，调用方不得已持锁）。
     清空现有索引，批量添加后保存。
     """
-    idx = faiss.IndexFlatIP(settings.embedding_dimension)
-    for vec in vectors:
-        v = l2_normalize(vec.copy()).reshape(1, -1).astype(np.float32)
-        idx.add(v)
-    save_index(username, idx)
+    lock_fd = acquire_lock(username)
+    if lock_fd < 0:
+        raise RuntimeError("faiss index lock busy")
+    try:
+        idx = faiss.IndexFlatIP(settings.embedding_dimension)
+        for vec in vectors:
+            v = l2_normalize(vec.copy()).reshape(1, -1).astype(np.float32)
+            idx.add(v)
+        save_index(username, idx)
+    finally:
+        release_lock(lock_fd)
 
 
 def l2_normalize(vec: np.ndarray) -> np.ndarray:
@@ -189,33 +207,3 @@ def release_lock(fd: int):
             os.close(fd)
         except OSError:
             pass
-
-
-def inspect_and_rebuild(username: str, db_count: int) -> int:
-    """
-    对比 MySQL 中用户的有效切片数与 FAISS ntotal。
-    不一致时自动重建索引，返回重建后的向量总数。
-
-    db_count: user_file_ai_desc 中 status=1 且 embedding IS NOT NULL 的行数。
-    返回: 重建后的 ntotal，一致时返回现有 ntotal。
-    """
-    ntotal = get_ntotal(username)
-    if ntotal == db_count and not is_dirty(username):
-        return ntotal
-
-    # 不一致或脏 → 加锁重建
-    lock_fd = acquire_lock(username)
-    if lock_fd < 0:
-        return ntotal
-
-    try:
-        # 二次确认
-        ntotal = get_ntotal(username)
-        if ntotal == db_count and not is_dirty(username):
-            return ntotal
-
-        # 需要重建但调用方未传入向量 → 仅清除 dirty
-        clear_dirty(username)
-        return ntotal
-    finally:
-        release_lock(lock_fd)

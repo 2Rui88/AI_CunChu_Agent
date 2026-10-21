@@ -77,7 +77,7 @@
 | 文件锁（防止并发同时重建） | `backend/app/faiss_service.py` | ✅ |
 | `rebuild_from_db` 适配分块（重建时按 chunk_index 回写） | `backend/app/faiss_service.py` | ✅ |
 | `share.py` 删除接入 mark_dirty（替代旧标记逻辑） | `backend/app/routers/share.py` | ✅ |
-| 定期巡检定时任务（对比 MySQL 切片数与 FAISS ntotal） | `backend/app/faiss_service.py` | ✅ |
+| 定期巡检定时任务（对比 MySQL 切片数与 FAISS ntotal） | — | ❌ 未实施（原 `inspect_and_rebuild` 为空操作且无调用方，已删除；删除场景由脏标记+搜索前自动重建覆盖） |
 | 验证：删除文件 → 下次搜索自动重建 → 已删文件不可搜到 | — | ✅ |
 
 ---
