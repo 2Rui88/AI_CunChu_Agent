@@ -52,17 +52,23 @@ async def md5_check(body: dict):
 async def upload(
     file: UploadFile = File(...),
     user: str = Form(""),
+    token: str = Form(""),
     md5: str = Form(""),
-    size: str = Form("0"),
 ):
+    if not await check_token(user, token):
+        return {"code": 4}
+
     ensure_bucket()
 
     content = await file.read()
-    file_size = int(size)
+    file_size = len(content)
     suffix = _get_suffix(file.filename)
 
-    if not md5:
-        md5 = hashlib.md5(content).hexdigest()
+    # 服务端计算 MD5，客户端上报值仅作比对，防止伪造 md5 覆盖他人文件
+    actual_md5 = hashlib.md5(content).hexdigest()
+    if md5 and md5.lower() != actual_md5:
+        return {"code": 1, "msg": "md5 mismatch"}
+    md5 = actual_md5
 
     async with Session() as db:
         result = await db.execute(select(FileInfo).where(FileInfo.md5 == md5))
@@ -83,7 +89,8 @@ async def upload(
             if result.scalar():
                 return {"code": 5}
         else:
-            object_name = f"{md5[:6]}/{file.filename}"
+            # 对象名使用完整 md5：同内容才可能同名，避免 md5[:6] 前缀碰撞覆盖他人文件
+            object_name = f"{md5}/{file.filename}"
             client.put_object(BUCKET, object_name, io.BytesIO(content), file_size)
             file_id = object_name
             url = f"/files/{BUCKET}/{object_name}"

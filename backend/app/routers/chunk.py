@@ -2,12 +2,13 @@
 分片上传模块 —— 支持大文件分片上传和断点续传
 
 流程: chunk_init → chunk_upload (循环) → chunk_merge
-Redis Key: chunk:<md5> Hash 存储分片元信息
-临时目录: /tmp/chunks/<md5>/ 存储分片数据
+Redis Key: chunk:<user>:<md5> Hash 存储分片元信息（按用户隔离）
+临时目录: /tmp/chunks/<用户名哈希>/<md5>/ 存储分片数据
 """
-import io
 import os
+import re
 import hashlib
+from urllib.parse import parse_qs
 from fastapi import APIRouter, Request
 from app.dependencies import check_token
 from app.redis_client import redis
@@ -18,6 +19,27 @@ from app.minio_client import client, BUCKET, ensure_bucket
 router = APIRouter(prefix="/api", tags=["chunk"])
 
 CHUNK_TEMP_DIR = "/tmp/chunks"
+
+# 合法 md5 为 32 位十六进制；同时杜绝 "../" 之类的路径穿越
+_MD5_RE = re.compile(r"^[0-9a-fA-F]{32}$")
+_MAX_CHUNK_COUNT = 1000000
+# 单个分片大小上限：前端 CHUNK_SIZE(10MB) + 传输余量，防止匿名灌盘
+_MAX_CHUNK_BODY = 12 * 1024 * 1024
+
+
+def _is_valid_md5(value: str) -> bool:
+    return bool(value) and _MD5_RE.fullmatch(value) is not None
+
+
+def _chunk_task_key(user: str, md5_val: str) -> str:
+    """分片任务 Redis 键（按用户隔离，避免不同用户上传相同内容时互相干扰/抢占任务）"""
+    return f"chunk:{user}:{md5_val}"
+
+
+def _chunk_dir(user: str, md5_val: str) -> str:
+    """分片临时目录（按用户隔离；用户名哈希后拼路径，杜绝特殊字符进入路径）"""
+    user_dir = hashlib.md5(user.encode()).hexdigest()
+    return os.path.join(CHUNK_TEMP_DIR, user_dir, md5_val)
 
 
 def _get_suffix(filename: str) -> str:
@@ -42,7 +64,12 @@ async def chunk_init(body: dict):
     filesize = body.get("size", 0)
     chunk_count = body.get("chunkCount", 0)
 
-    redis_key = f"chunk:{file_md5}"
+    if not _is_valid_md5(file_md5):
+        return {"code": 1, "msg": "invalid md5"}
+    if not isinstance(chunk_count, int) or chunk_count < 1 or chunk_count > _MAX_CHUNK_COUNT:
+        return {"code": 1, "msg": "invalid chunkCount"}
+
+    redis_key = _chunk_task_key(user, file_md5)
 
     # 检查是否已存在分片任务（断点续传）
     exists = await redis.exists(redis_key)
@@ -63,8 +90,7 @@ async def chunk_init(body: dict):
     await redis.expire(redis_key, 86400)  # 24小时过期
 
     # 创建分片临时目录
-    chunk_dir = os.path.join(CHUNK_TEMP_DIR, file_md5)
-    os.makedirs(chunk_dir, exist_ok=True)
+    os.makedirs(_chunk_dir(user, file_md5), exist_ok=True)
 
     return {"code": 0, "chunkCount": chunk_count, "uploadedChunks": ""}
 
@@ -73,34 +99,48 @@ async def chunk_init(body: dict):
 async def chunk_upload(request: Request):
     """
     分片上传 —— 接收单个分片的二进制数据，保存到本地临时目录。
-    更新 Redis 中已上传的分片索引列表。
+    必须携带 user + token（且与任务发起人一致），限制单片大小，
+    防止未授权写入与他人恶意污染/灌盘。
     """
-    # 从 query string 获取参数
-    query = request.url.query or ""
-    md5_val = ""
-    idx = 0
-    for part in query.split("&"):
-        if "=" in part:
-            k, v = part.split("=", 1)
-            if k == "md5":
-                md5_val = v
-            elif k == "index":
-                idx = int(v)
+    qs = parse_qs(request.url.query)
+    md5_val = (qs.get("md5") or [""])[0]
+    user = (qs.get("user") or [""])[0]
+    token = (qs.get("token") or [""])[0]
+    idx_raw = (qs.get("index") or [""])[0]
 
-    if not md5_val:
-        return {"code": 1}
+    # 只接受 32 位十六进制 md5，防止路径穿越写任意路径
+    if not _is_valid_md5(md5_val):
+        return {"code": 1, "msg": "invalid md5"}
+    try:
+        idx = int(idx_raw)
+    except ValueError:
+        return {"code": 1, "msg": "invalid index"}
+    if idx < 0 or idx >= _MAX_CHUNK_COUNT:
+        return {"code": 1, "msg": "invalid index"}
 
-    # Token 可选校验
-    redis_key = f"chunk:{md5_val}"
-    user = await redis.hget(redis_key, "user")
-    if not user:
-        return {"code": 1}
+    # 鉴权：token 有效，且请求者必须是该分片任务的发起人
+    if not await check_token(user, token):
+        return {"code": 4}
+    redis_key = _chunk_task_key(user, md5_val)
+    task_owner = await redis.hget(redis_key, "user")
+    if not task_owner or task_owner != user:
+        return {"code": 1, "msg": "chunk task not found"}
 
-    # 读取分片二进制数据
+    # 单片大小限制：先看声明长度（提前拒绝），再校验实际 body
+    declared = request.headers.get("content-length")
+    if declared is not None:
+        try:
+            if int(declared) > _MAX_CHUNK_BODY:
+                return {"code": 1, "msg": "chunk too large"}
+        except ValueError:
+            return {"code": 1, "msg": "invalid content-length"}
+
     body = await request.body()
+    if len(body) > _MAX_CHUNK_BODY:
+        return {"code": 1, "msg": "chunk too large"}
 
     # 保存分片到临时文件
-    chunk_dir = os.path.join(CHUNK_TEMP_DIR, md5_val)
+    chunk_dir = _chunk_dir(user, md5_val)
     os.makedirs(chunk_dir, exist_ok=True)
     chunk_path = os.path.join(chunk_dir, str(idx))
     with open(chunk_path, "wb") as f:
@@ -129,7 +169,9 @@ async def chunk_merge(body: dict):
 
     md5_val = body.get("md5", "")
     filename = body.get("filename", "")
-    redis_key = f"chunk:{md5_val}"
+    if not _is_valid_md5(md5_val):
+        return {"code": 1, "msg": "invalid md5"}
+    redis_key = _chunk_task_key(user, md5_val)
 
     chunk_count_str = await redis.hget(redis_key, "chunk_count")
     if not chunk_count_str:
@@ -143,9 +185,9 @@ async def chunk_merge(body: dict):
     if len(uploaded) != chunk_count:
         return {"code": 1, "msg": f"分片不完整: {len(uploaded)}/{chunk_count}"}
 
-    # 合并分片到完整文件
-    chunk_dir = os.path.join(CHUNK_TEMP_DIR, md5_val)
-    merged_path = os.path.join(CHUNK_TEMP_DIR, f"{md5_val}_merged")
+    # 合并分片到完整文件（目录按用户隔离，避免并发合并互相覆盖）
+    chunk_dir = _chunk_dir(user, md5_val)
+    merged_path = chunk_dir + "_merged"
     with open(merged_path, "wb") as out:
         for i in range(chunk_count):
             chunk_path = os.path.join(chunk_dir, str(i))
@@ -172,7 +214,8 @@ async def chunk_merge(body: dict):
             url = existing.url
         else:
             ensure_bucket()
-            object_name = f"{md5_val[:6]}/{filename}"
+            # 对象名使用完整 md5（合并前已做内容 MD5 校验），避免前缀碰撞覆盖
+            object_name = f"{md5_val}/{filename}"
             with open(merged_path, "rb") as f:
                 client.put_object(BUCKET, object_name, f, file_size)
             url = f"/files/{BUCKET}/{object_name}"
