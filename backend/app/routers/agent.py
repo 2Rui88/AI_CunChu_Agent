@@ -42,9 +42,40 @@ SYSTEM_PROMPT = """你是 AI云存储 的文件管理助手。你可以帮助用
 - 如果搜索无结果，建议用户尝试不同描述词
 - 始终使用中文回复"""
 
-# ── 内存中的确认等待池 ──
-_confirmation_pool: dict[str, asyncio.Event] = {}
-_confirmation_results: dict[str, str] = {}
+# ── 危险操作确认（Redis 实现，跨 gunicorn worker 共享）──
+# 旧实现为进程内存字典，/confirm 落到其他 worker 时永远找不到确认单，
+# 只能等超时。迁到 Redis 后任意 worker 都能读写同一条确认记录。
+CONFIRM_KEY_PREFIX = "agent:confirm:"
+CONFIRM_TTL = 310              # 略长于等待超时，未决确认自动过期清理
+CONFIRM_POLL_INTERVAL = 0.5    # 轮询间隔（秒）
+CONFIRM_WAIT_TIMEOUT = 300     # 等待用户确认的超时（秒）
+
+
+async def _create_confirmation(token: str, user: str, tool_name: str):
+    """登记一条待确认记录（所有 worker 经 Redis 可见）"""
+    payload = json.dumps(
+        {"user": user, "tool": tool_name, "decision": ""},
+        ensure_ascii=False,
+    )
+    await redis.setex(f"{CONFIRM_KEY_PREFIX}{token}", CONFIRM_TTL, payload)
+
+
+async def _wait_confirmation(token: str, timeout: int) -> str:
+    """轮询等待用户决策，返回 approved / rejected / timeout"""
+    key = f"{CONFIRM_KEY_PREFIX}{token}"
+    loop = asyncio.get_running_loop()
+    deadline = loop.time() + timeout
+    while loop.time() < deadline:
+        raw = await redis.get(key)
+        if raw:
+            try:
+                decision = json.loads(raw).get("decision", "")
+            except json.JSONDecodeError:
+                decision = ""
+            if decision:
+                return decision
+        await asyncio.sleep(CONFIRM_POLL_INTERVAL)
+    return "timeout"
 
 
 # ── 工具定义（OpenAI function calling 格式）──
@@ -216,8 +247,7 @@ async def agent_chat(body: ChatRequest):
                         # 危险操作确认门控
                         if name in DESTRUCTIVE_TOOLS:
                             confirm_token = str(uuid.uuid4())
-                            event = asyncio.Event()
-                            _confirmation_pool[confirm_token] = event
+                            await _create_confirmation(confirm_token, body.user, name)
 
                             # 获取文件信息用于展示
                             file_info = {}
@@ -240,14 +270,8 @@ async def agent_chat(body: ChatRequest):
                                 "message": f"{msg_text} '{file_info.get('filename', identifier)}'？",
                             })
 
-                            # 等待确认
-                            try:
-                                await asyncio.wait_for(event.wait(), timeout=300)
-                            except asyncio.TimeoutError:
-                                decision = "timeout"
-                            else:
-                                decision = _confirmation_results.pop(confirm_token, "rejected")
-                            _confirmation_pool.pop(confirm_token, None)
+                            # 等待确认（Redis 轮询，任意 worker 的 /confirm 都能送达）
+                            decision = await _wait_confirmation(confirm_token, CONFIRM_WAIT_TIMEOUT)
 
                             if decision != "approved":
                                 result = {"canceled": True, "message": "用户取消" if decision == "rejected" else "确认超时"}
@@ -285,18 +309,29 @@ async def agent_chat(body: ChatRequest):
 
 @router.post("/confirm")
 async def agent_confirm(body: ConfirmRequest):
-    """确认或拒绝危险操作"""
+    """确认或拒绝危险操作（写入 Redis，由发起对话的 worker 轮询读取）"""
     if not await check_token(body.user, body.token):
         return {"code": 4}
 
-    if body.confirmation_token not in _confirmation_pool:
+    key = f"{CONFIRM_KEY_PREFIX}{body.confirmation_token}"
+    raw = await redis.get(key)
+    if not raw:
         return {"code": 1, "msg": "confirmation token expired or invalid"}
+
+    try:
+        data = json.loads(raw)
+    except json.JSONDecodeError:
+        return {"code": 1, "msg": "confirmation record corrupted"}
+
+    # 确认令牌必须归属当前请求用户
+    if data.get("user") != body.user:
+        return {"code": 1, "msg": "confirmation token does not belong to this user"}
 
     if body.decision not in ("approved", "rejected"):
         return {"code": 1, "msg": "decision must be approved or rejected"}
 
-    _confirmation_results[body.confirmation_token] = body.decision
-    _confirmation_pool[body.confirmation_token].set()
+    data["decision"] = body.decision
+    await redis.setex(key, CONFIRM_TTL, json.dumps(data, ensure_ascii=False))
     return {"code": 0, "msg": body.decision}
 
 
