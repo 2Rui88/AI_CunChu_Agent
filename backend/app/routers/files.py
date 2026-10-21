@@ -5,7 +5,7 @@ from sqlalchemy import select
 from app.database import Session
 from app.models import FileInfo, UserFileList, UserFileCount
 from app.dependencies import check_token
-from app.minio_client import client, BUCKET, ensure_bucket
+from app.minio_client import client, BUCKET, ensure_bucket, presign_from_db_url
 
 router = APIRouter(prefix="/api", tags=["files"])
 
@@ -143,7 +143,7 @@ async def myfiles(body: dict):
             files.append({
                 "md5": ufl.md5,
                 "file_name": ufl.file_name,
-                "url": fi.url,
+                "url": presign_from_db_url(fi.url) if fi.url else "",
                 "size": fi.size,
                 "type": fi.type,
                 "pv": ufl.pv,

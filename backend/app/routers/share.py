@@ -18,7 +18,7 @@ from app.models import (
 )
 from app.dependencies import check_token
 from app.redis_client import redis
-from app.minio_client import client, BUCKET
+from app.minio_client import client, BUCKET, presign_from_db_url
 from app.faiss_service import mark_dirty
 
 router = APIRouter(prefix="/api", tags=["share"])
@@ -265,7 +265,7 @@ async def sharefiles(request: Request, body: dict):
                     "md5": r.md5,
                     "file_name": r.file_name,
                     "pv": r.pv,
-                    "url": fi.url if fi else "",
+                    "url": presign_from_db_url(fi.url) if fi and fi.url else "",
                     "create_time": str(r.create_time),
                 })
             return {"code": 0, "files": files}

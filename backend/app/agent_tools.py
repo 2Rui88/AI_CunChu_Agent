@@ -27,7 +27,7 @@ from app.faiss_service import (
     l2_normalize, get_ntotal,
     mark_dirty,
 )
-from app.minio_client import client as minio_client, BUCKET
+from app.minio_client import client as minio_client, BUCKET, presign_from_db_url
 
 # ── 危险操作集合（Agent 确认门控用）──
 DESTRUCTIVE_TOOLS = {"delete_file", "share_file"}
@@ -112,7 +112,7 @@ async def tool_search_files(username: str, **kwargs) -> dict:
                         "md5": uad.md5,
                         "filename": ufl.file_name,
                         "description": compressed,
-                        "url": fi.url,                          # 引用溯源
+                        "url": presign_from_db_url(fi.url),      # 引用溯源（限时签名链接）
                         "size": str(fi.size),
                         "type": fi.type,
                         "score": round(score, 4),
@@ -155,7 +155,7 @@ async def tool_get_file_info(username: str, **kwargs) -> dict:
                 "filename": ufl.file_name,
                 "size": fi.size,
                 "type": fi.type,
-                "url": fi.url,
+                "url": presign_from_db_url(fi.url) if fi.url else "",
                 "pv": ufl.pv,
                 "shared": ufl.shared_status == 1,
                 "create_time": str(ufl.create_time),
@@ -188,7 +188,7 @@ async def tool_list_recent_files(username: str, **kwargs) -> dict:
                     "filename": ufl.file_name,
                     "size": fi.size,
                     "type": fi.type,
-                    "url": fi.url,
+                    "url": presign_from_db_url(fi.url) if fi.url else "",
                     "create_time": str(ufl.create_time),
                 })
             return {"count": len(files), "files": files}

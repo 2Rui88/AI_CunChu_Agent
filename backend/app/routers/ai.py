@@ -23,6 +23,7 @@ from app.database import Session
 from app.models import FileInfo, UserFileList, FileAiDesc, UserFileAiDesc
 from app.dependencies import check_token
 from app.config import settings
+from app.minio_client import presign_url, presign_internal_url, presign_from_db_url, db_url_to_object
 from app.dashscope_client import describe_image, get_embedding, create_client
 from app.faiss_service import (
     search as faiss_search,
@@ -42,23 +43,10 @@ SCORE_THRESHOLD = 0.45
 
 def _build_public_url(db_url: str) -> str:
     """
-    将数据库中的文件 URL 替换为公网可访问的 URL。
-    DashScope Qwen-VL 需要能直接下载图片，所以必须用公网地址。
-    如果未配置 public_server_ip，则回退到 web_server_ip（仅 Docker 内网可用）。
+    供 DashScope（Qwen-VL）下载图片的公网 URL。
+    桶已私有化，必须带预签名；scheme/host 由 public_server_* 配置决定。
     """
-    ip = settings.public_server_ip or settings.web_server_ip
-    port = settings.public_server_port or settings.web_server_port
-
-    path_part = db_url
-    for prefix in ("http://", "https://"):
-        if path_part.startswith(prefix):
-            path_part = path_part[len(prefix):]
-            pos = path_part.find("/")
-            if pos > 0:
-                path_part = path_part[pos:]
-            break
-
-    return f"http://{ip}:{port}{path_part}"
+    return presign_url(db_url_to_object(db_url), expires=3600)
 
 
 # ============================================================
@@ -464,21 +452,11 @@ def _extract_xlsx_text(data: bytes, filename: str) -> tuple[str, dict]:
 
 def _build_internal_url(db_url: str) -> str:
     """
-    构造 Docker 内网可访问的文件下载 URL（用于后端下载文本/docx 文件）。
-    直接连 MinIO 获取文件（不走 Nginx 避免 HTTPS 重定向）。
+    构造后端内网自取文件的下载 URL（用于下载文本/docx/pdf/xlsx 内容）。
+    桶已私有化，直接连 MinIO 获取需带签名；签出的 URL 即内网端点本身。
     db_url 格式: /files/{bucket}/{object_name}
     """
-    path_part = db_url
-    # 去掉 /files/{bucket}/ 前缀，得到 MinIO object name
-    if path_part.startswith("/files/"):
-        # /files/files/ab/cd/name.txt → ab/cd/name.txt
-        parts = path_part.split("/", 3)  # ['', 'files', 'files', 'ab/cd/name.txt']
-        if len(parts) >= 4:
-            path_part = "/" + parts[3]
-
-    return (
-        f"http://{settings.minio_endpoint}/{settings.minio_bucket}{path_part}"
-    )
+    return presign_internal_url(db_url_to_object(db_url))
 
 
 async def _copy_cache_to_user(db, user: str, md5_val: str, caches: list) -> dict:
@@ -746,7 +724,7 @@ async def _keyword_search(user: str, keywords: list[str], query: str = "",
             files = []
             for row in rows:
                 files.append({
-                    "md5": row[0], "filename": row[1], "url": row[2],
+                    "md5": row[0], "filename": row[1], "url": presign_from_db_url(row[2]),
                     "size": str(row[3] or 0), "type": row[4], "pv": row[5],
                     "hit_count": row[6], "source": "keyword",
                 })
@@ -905,7 +883,7 @@ async def ai_search(body: dict):
                         "md5": md5,
                         "filename": ufl.file_name,
                         "description": uad.description,
-                        "url": fi.url, "size": str(fi.size), "type": fi.type,
+                        "url": presign_from_db_url(fi.url), "size": str(fi.size), "type": fi.type,
                         "score": round(score, 4),
                         "rank": rank_i + 1,
                         "match_context": uad.context_label or "",

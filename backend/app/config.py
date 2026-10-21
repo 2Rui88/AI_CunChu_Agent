@@ -44,11 +44,12 @@ class Settings(BaseSettings):
         "包括主要物体、场景、颜色、文字等信息。"
     )
 
-    # ── 服务器地址（供 DashScope 回调下载图片）──
+    # ── 服务器地址（供生成对外预签名下载 URL）──
     web_server_ip: str = "172.30.0.5"    # Nginx 容器 IP（Docker 内网，供后端下载文本文件）
     web_server_port: str = "443"          # Nginx HTTPS 端口
-    public_server_ip: str = ""            # 公网 IP（DashScope 可访问，部署时填写）
-    public_server_port: str = "8080"      # 公网端口（如使用 Nginx 反向代理则为 443）
+    public_server_ip: str = ""            # 公网 IP/域名（浏览器与 DashScope 可达；为空则退回 minio_endpoint 直连）
+    public_server_port: str = "443"       # 公网端口（默认走 Nginx 443）
+    public_server_ssl: bool = True        # 对外地址是否为 HTTPS（Nginx 默认 443 为是）
 
     # ── FAISS ──
     faiss_user_index_dir: str = "/data/faiss/users"
