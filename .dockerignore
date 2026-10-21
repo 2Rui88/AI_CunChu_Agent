@@ -1,0 +1,17 @@
+# 根目录构建上下文（nginx 多阶段构建）排除项
+
+# 前端本地依赖与产物（镜像内用 npm ci 重新安装构建）
+frontend/node_modules
+frontend/build
+
+# 废弃旧前端（含历史 node_modules）
+picture_bed
+
+# 版本库与文档
+.git
+*.md
+
+# 本地敏感配置与运行时产物
+docker/.env
+backend/.env
+**/__pycache__

@@ -56,7 +56,9 @@ services:
 
   nginx:
     build:
-      context: ./nginx
+      # 上下文为项目根目录：Dockerfile 需要访问 frontend/ 做多阶段构建
+      context: ..
+      dockerfile: docker/nginx/Dockerfile
     container_name: tc_nginx
     restart: unless-stopped
     ports:
