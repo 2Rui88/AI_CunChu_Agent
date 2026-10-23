@@ -1,12 +1,13 @@
 import React, { useState, useEffect, useMemo } from 'react';
 import {
-  Card, Table, message, Button, Tooltip, Space, Progress, Input, Empty, Upload,
+  Card, Table, message, Button, Tooltip, Space, Progress, Input, Empty, Upload, Modal,
 } from 'antd';
 import {
   UploadOutlined, ShareAltOutlined, DeleteOutlined, DownloadOutlined,
-  CheckCircleOutlined, SearchOutlined,
+  CheckCircleOutlined, SearchOutlined, FileSearchOutlined,
 } from '@ant-design/icons';
 import styled from '@emotion/styled';
+import { API_CONFIG } from '../config';
 import { useAuth } from '../contexts/AuthContext';
 import { fetchUserImages, uploadImage, deleteImage, shareFile, cancelShareFile, pvFile } from '../services/images';
 import { describeFileByMd5 } from '../services/ai';
@@ -146,6 +147,36 @@ const FileList = () => {
     document.body.removeChild(link);
   };
 
+  // 大文件（超内容索引门槛）手动建立内容索引：后端以 force 重新提取，硬上限放宽
+  const handleBuildIndex = (record) => {
+    const apiKey = localStorage.getItem('dashscope_api_key_' + user.username) || '';
+    if (!apiKey) {
+      message.warning('请先在首页设置 DashScope API Key');
+      return;
+    }
+    Modal.confirm({
+      title: '建立内容索引',
+      content: `「${record.file_name}」体积较大，提取内容可能需要一些时间，确定继续？`,
+      okText: '开始建立',
+      cancelText: '取消',
+      onOk: async () => {
+        const msgKey = 'buildIndex';
+        message.loading({ content: '正在提取内容并建立索引...', key: msgKey, duration: 0 });
+        try {
+          await describeFileByMd5(record.md5, record.file_name, record.type, user, apiKey);
+          message.success({ content: '内容索引已建立，现在可以按内容搜索该文件', key: msgKey });
+        } catch (err) {
+          if (err.tokenExpired) {
+            message.destroy(msgKey);
+            logout();
+            return;
+          }
+          message.error({ content: err.message || '建立失败', key: msgKey });
+        }
+      },
+    });
+  };
+
   useEffect(() => {
     if (user && user.token) {
       fetchFiles();
@@ -199,7 +230,7 @@ const FileList = () => {
     {
       title: '操作',
       key: 'action',
-      width: 170,
+      width: 200,
       render: (_, record) => (
         <Space>
           <Tooltip title={record.share_status === 1 ? '取消分享' : '分享到共享广场'}>
@@ -214,6 +245,11 @@ const FileList = () => {
           <Tooltip title="下载">
             <Button type="text" icon={<DownloadOutlined />} onClick={() => handleDownload(record)} />
           </Tooltip>
+          {Number(record.size) > API_CONFIG.CONTENT_INDEX_LIMIT && (
+            <Tooltip title="建立内容索引（该文件较大，尚未索引内容）">
+              <Button type="text" icon={<FileSearchOutlined style={{ color: '#d97706' }} />} onClick={() => handleBuildIndex(record)} />
+            </Tooltip>
+          )}
           <Tooltip title="删除">
             <Button type="text" danger icon={<DeleteOutlined />} onClick={() => handleDelete(record)} />
           </Tooltip>

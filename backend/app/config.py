@@ -38,7 +38,12 @@ class Settings(BaseSettings):
     embedding_dimension: int = 768                 # 向量维度（tongyi-embedding-vision-flash 模型为 768）
     embedding_max_chars: int = 3000               # 单切片最大字符数（分块阈值，与模型 token 上限对齐）
     vl_timeout: int = 60                           # Qwen-VL 请求超时秒数
-    pdf_max_extract_chars: int = 8000              # PDF 单次提取最大字符数
+    # ── 内容提取三层策略 ──
+    # 第 1 层：解析安全线（体积门槛只管"读起来安不安全"，不管"值不值得索引"）
+    parse_max_mb: int = 100                        # 常规提取允许的最大文件体积（MB）
+    parse_max_mb_forced: int = 1024                # 手动"建立内容索引"时的硬上限（MB）
+    # 第 2 层：统一字符预算（真正的索引成本线，所有类型收满即停、交给分块器切分）
+    extract_char_budget: int = 30000
     vl_prompt: str = (
         "请用中文详细描述这张图片的内容，"
         "包括主要物体、场景、颜色、文字等信息。"

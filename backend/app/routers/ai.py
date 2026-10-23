@@ -19,7 +19,7 @@ from app.chunker import chunk_text, Chunk
 import numpy as np
 import httpx
 from fastapi import APIRouter
-from sqlalchemy import select, text
+from sqlalchemy import select, text, delete
 from app.database import Session
 from app.models import FileInfo, UserFileList, FileAiDesc, UserFileAiDesc
 from app.dependencies import check_token
@@ -33,15 +33,87 @@ from app.faiss_service import (
     l2_normalize,
     get_ntotal,
     load_index,
-    is_dirty, clear_dirty,
+    is_dirty, clear_dirty, mark_dirty,
 )
 
 router = APIRouter(prefix="/api", tags=["ai"])
 
 # 兼容旧 C 项目的分数阈值
 SCORE_THRESHOLD = 0.45
-# 内容提取（文本/docx/pdf/xlsx）的最大下载体积，超过则跳过提取、退化为文件名描述
-_MAX_EXTRACT_BYTES = 16 * 1024 * 1024
+
+# ── 内容提取三层策略 ──
+# 体积门槛（parse_max_mb）只做解析安全线；索引成本由字符预算（extract_char_budget）控制；
+# 超过安全线/提取失败时退化为结构化存根，并由用户手动决定是否花成本建立内容索引。
+
+_TOO_LARGE_MSG = "文件超过解析上限"
+_EXTRACT_FAIL_MSG = "内容提取失败"
+
+
+class _DownloadTooLarge(Exception):
+    """文件体积超过解析安全线（在下载中途即断开，内存有界）"""
+
+
+def _normal_cap() -> int:
+    """常规提取的解析安全线（字节）"""
+    return settings.parse_max_mb * 1024 * 1024
+
+
+def _forced_cap() -> int:
+    """手动"建立内容索引"时的硬上限（字节）"""
+    return max(settings.parse_max_mb_forced, settings.parse_max_mb) * 1024 * 1024
+
+
+def _human_size(n) -> str:
+    if n is None:
+        return "未知"
+    if n < 1024:
+        return f"{n} B"
+    if n < 1024 * 1024:
+        return f"{n / 1024:.1f} KB"
+    if n < 1024 * 1024 * 1024:
+        return f"{n / 1024 / 1024:.1f} MB"
+    return f"{n / 1024 / 1024 / 1024:.2f} GB"
+
+
+def _make_stub_description(file_type: str, filename: str, size, reason: str) -> str:
+    """降级存根：至少让文件名/类型/大小可被语义检索，并明确标记未做内容索引"""
+    return (
+        f"文件名：{filename}\n"
+        f"类型：{file_type or '未知'}类型文件\n"
+        f"大小：{_human_size(size)}\n"
+        f"状态：{reason}，仅建立文件名索引；可在文件列表中手动建立内容索引"
+    )
+
+
+async def _download_capped(file_url: str, cap_bytes: int) -> bytes:
+    """
+    流式下载并在超限时立即中止：
+    - 先按 Content-Length 预检（有则一个字节都不下载）
+    - 下载中逐块累计，超限即断开连接
+    内存占用最多约 cap_bytes，避免大文件先全量读入再检查。
+    """
+    try:
+        async with httpx.AsyncClient(timeout=60) as client:
+            async with client.stream("GET", file_url) as resp:
+                if resp.status_code != 200:
+                    raise RuntimeError(f"unexpected status {resp.status_code}")
+                declared = resp.headers.get("content-length")
+                if declared:
+                    try:
+                        if int(declared) > cap_bytes:
+                            raise _DownloadTooLarge()
+                    except ValueError:
+                        pass
+                buf = bytearray()
+                async for block in resp.aiter_bytes(1024 * 1024):
+                    buf.extend(block)
+                    if len(buf) > cap_bytes:
+                        raise _DownloadTooLarge()
+                return bytes(buf)
+    except _DownloadTooLarge:
+        raise
+    except Exception as exc:
+        raise RuntimeError(f"download failed: {exc}") from exc
 
 
 def _build_public_url(db_url: str) -> str:
@@ -111,13 +183,27 @@ async def ai_describe(body: dict):
             if caches:
                 return await _copy_cache_to_user(db, user, md5_val, caches)
 
-        # 生成描述（返回描述文本 + 结构化 metadata 供分块器使用）
-        description, metadata = await _generate_description(db, md5_val, filename, file_type, api_key)
+        # 强制重建：先清掉旧切片记录（新旧分块数可能不同，避免残留过期切片）
+        if force:
+            await db.execute(
+                delete(UserFileAiDesc).where(
+                    UserFileAiDesc.user == user, UserFileAiDesc.md5 == md5_val
+                )
+            )
+
+        # 生成描述（返回 描述文本 + 结构化 metadata + 是否为降级存根）
+        description, metadata, is_stub = await _generate_description(
+            db, md5_val, filename, file_type, api_key, force=force
+        )
         if not description:
             return {"code": 1, "msg": "describe failed"}
 
         # 分块 + 逐块向量化 + 存储（传入 metadata 供 PDF/Excel 切分器使用）
         chunks = chunk_text(file_type, description, metadata=metadata)
+        if is_stub:
+            # 降级存根统一打标：搜索结果以"未索引内容"标签呈现，前端可提示手动补索引
+            for ch in chunks:
+                ch.context_label = "未索引内容"
         vecs: list[np.ndarray] = []
 
         for ch in chunks:
@@ -151,18 +237,27 @@ async def ai_describe(body: dict):
         except Exception:
             return {"code": 1, "msg": "faiss write failed"}
 
+    # 强制重建后分块集合已变化：标记索引脏，下次搜索前自动按新记录重建
+    if force:
+        try:
+            mark_dirty(user)
+        except Exception:
+            pass
+
     return {"code": 0, "msg": "ok"}
 
 
 async def _generate_description(db, md5_val: str, filename: str, file_type: str,
-                                api_key: str) -> tuple[str, dict | None]:
+                                api_key: str, force: bool = False) -> tuple[str, dict | None, bool]:
     """
-    按文件类型生成中文描述，返回 (描述文本, 结构化metadata)。
+    按文件类型生成中文描述，返回 (描述文本, 结构化metadata, 是否为降级存根)。
     metadata 供 chunker 使用（PDF 页面列表、Excel 工作表行等）。
+    体积门槛（force 时放宽到硬上限）只做解析安全线；超过或提取失败时
+    返回结构化存根（含"未索引内容"语义，前端可提示手动建立内容索引）。
     """
     ft = file_type.lower()
 
-    # ── 图片：Qwen-VL 多模态描述 ──
+    # ── 图片：Qwen-VL 多模态描述（不涉及内容下载）──
     if ft in _IMAGE_TYPES:
         result = await db.execute(
             select(FileInfo).where(FileInfo.md5 == md5_val).limit(1)
@@ -171,8 +266,10 @@ async def _generate_description(db, md5_val: str, filename: str, file_type: str,
         if fi and fi.url:
             public_url = _build_public_url(fi.url)
             desc = await describe_image(api_key, public_url)
-            return desc, None
-        return f"图片文件：{filename}", None
+            return desc, None, False
+        return f"图片文件：{filename}", None, False
+
+    cap = _forced_cap() if force else _normal_cap()
 
     # ── PDF：返回页面列表 + 格式化描述 ──
     if ft == "pdf":
@@ -182,10 +279,12 @@ async def _generate_description(db, md5_val: str, filename: str, file_type: str,
         fi = result.scalar()
         if fi and fi.url:
             internal_url = _build_internal_url(fi.url)
-            desc, meta = await _download_and_extract_pdf(internal_url, filename)
+            desc, meta, err = await _download_and_extract_pdf(internal_url, filename, cap)
             if desc:
-                return desc, meta
-        return f"PDF文件：{filename}", None
+                return desc, meta, False
+            if err:
+                return _make_stub_description(ft, filename, fi.size, err), None, True
+        return f"PDF文件：{filename}", None, False
 
     # ── Excel：返回 sheet 行数据 + 格式化描述 ──
     if ft in ("xlsx", "xls"):
@@ -195,10 +294,12 @@ async def _generate_description(db, md5_val: str, filename: str, file_type: str,
         fi = result.scalar()
         if fi and fi.url:
             internal_url = _build_internal_url(fi.url)
-            desc, meta = await _download_and_extract_xlsx(internal_url, filename)
+            desc, meta, err = await _download_and_extract_xlsx(internal_url, filename, cap)
             if desc:
-                return desc, meta
-        return f"Excel文件：{filename}", None
+                return desc, meta, False
+            if err:
+                return _make_stub_description(ft, filename, fi.size, err), None, True
+        return f"Excel文件：{filename}", None, False
 
     # ── 文本类 / docx：下载文件提取内容 ──
     if ft in _TEXT_TYPES or ft == "docx":
@@ -208,12 +309,14 @@ async def _generate_description(db, md5_val: str, filename: str, file_type: str,
         fi = result.scalar()
         if fi and fi.url:
             internal_url = _build_internal_url(fi.url)
-            content = await _download_and_extract(internal_url, ft)
+            content, err = await _download_and_extract(internal_url, ft, cap)
             if content:
-                return _format_text_description(filename, content), None
+                return _format_text_description(filename, content), None, False
+            if err:
+                return _make_stub_description(ft, filename, fi.size, err), None, True
 
     # ── 其他：类型 + 文件名 ──
-    return f"{file_type or '未知'}类型的文件：{filename}", None
+    return f"{file_type or '未知'}类型的文件：{filename}", None, False
 
 
 # ── 支持的文件类型 ──
@@ -226,28 +329,24 @@ _TEXT_TYPES = {
 }
 
 
-async def _download_and_extract(file_url: str, file_type: str) -> str | None:
+async def _download_and_extract(file_url: str, file_type: str, cap_bytes: int) -> tuple[str | None, str | None]:
     """
-    下载文件并提取文本内容。
-    - 普通文本文件 → 直接读取（最多 8192 字节）
-    - docx → 解压 ZIP 后解析 word/document.xml 中的 <w:t> 标签
+    下载文本/docx 文件并提取文本。
+    返回 (文本, 失败原因|None)——失败原因为 _TOO_LARGE_MSG / _EXTRACT_FAIL_MSG，
+    调用方据此生成降级存根。
     """
     try:
-        async with httpx.AsyncClient(timeout=30) as client:
-            resp = await client.get(file_url)
-            if resp.status_code != 200:
-                return None
-            if len(resp.content) > _MAX_EXTRACT_BYTES:
-                return None
-            data = resp.content
-    except Exception:
-        return None
+        data = await _download_capped(file_url, cap_bytes)
+    except _DownloadTooLarge:
+        return None, _TOO_LARGE_MSG
+    except RuntimeError:
+        return None, _EXTRACT_FAIL_MSG
 
     if file_type == "docx":
-        return await asyncio.to_thread(_parse_docx, data)
-
-    # 普通文本：直接解码（尝试 utf-8，失败则 latin-1）
-    return await asyncio.to_thread(_decode_text, data)
+        text = await asyncio.to_thread(_parse_docx, data)
+    else:
+        text = await asyncio.to_thread(_decode_text, data)
+    return text, None  # text 为 None 表示解析不出内容，由调用方走原兜底
 
 
 def _parse_docx(data: bytes) -> str | None:
@@ -283,26 +382,23 @@ def _decode_text(data: bytes) -> str | None:
 
 
 def _format_text_description(filename: str, content: str) -> str:
-    """格式化文本/文档描述：文件名 + 内容（截断到 3000 字符）"""
-    desc_len = min(len(content), 3000)
-    return f"文件名：{filename}\n文件内容：{content[:desc_len]}"
+    """格式化文本/文档描述：文件名 + 内容（截断到统一字符预算）"""
+    budget = settings.extract_char_budget
+    return f"文件名：{filename}\n文件内容：{content[:budget]}"
 
 
 # ── PDF 文本提取 ──
 
-async def _download_and_extract_pdf(file_url: str, filename: str) -> tuple[str | None, dict | None]:
-    """下载 PDF 二进制并提取文本，返回 (描述, {pages, font_sizes})"""
+async def _download_and_extract_pdf(file_url: str, filename: str, cap_bytes: int) -> tuple[str | None, dict | None, str | None]:
+    """下载 PDF 并提取文本，返回 (描述, metadata, 失败原因|None)"""
     try:
-        async with httpx.AsyncClient(timeout=30) as client:
-            resp = await client.get(file_url)
-            if resp.status_code != 200:
-                return None, None
-            if len(resp.content) > _MAX_EXTRACT_BYTES:
-                return None, None
-            data = resp.content
-    except Exception:
-        return None, None
-    return await asyncio.to_thread(_extract_pdf_text, data, filename)
+        data = await _download_capped(file_url, cap_bytes)
+    except _DownloadTooLarge:
+        return None, None, _TOO_LARGE_MSG
+    except RuntimeError:
+        return None, None, _EXTRACT_FAIL_MSG
+    desc, meta = await asyncio.to_thread(_extract_pdf_text, data, filename)
+    return desc, meta, None
 
 
 def _extract_pdf_text(data: bytes, filename: str) -> tuple[str, dict]:
@@ -325,7 +421,7 @@ def _extract_pdf_text(data: bytes, filename: str) -> tuple[str, dict]:
         doc.close()
         return f"PDF文件（无页面）：{filename}", meta
 
-    max_chars = settings.pdf_max_extract_chars
+    max_chars = settings.extract_char_budget
     text_parts: list[str] = []
     scanned = 0
     for i in range(total):
@@ -389,19 +485,16 @@ def _clean_pdf_text(text: str) -> str:
 
 # ── Excel 表格提取 ──
 
-async def _download_and_extract_xlsx(file_url: str, filename: str) -> tuple[str | None, dict | None]:
-    """下载 Excel 二进制并提取文本，返回 (描述, {sheets: [{name, rows}]})"""
+async def _download_and_extract_xlsx(file_url: str, filename: str, cap_bytes: int) -> tuple[str | None, dict | None, str | None]:
+    """下载 Excel 并提取文本，返回 (描述, {sheets}, 失败原因|None)"""
     try:
-        async with httpx.AsyncClient(timeout=30) as client:
-            resp = await client.get(file_url)
-            if resp.status_code != 200:
-                return None, None
-            if len(resp.content) > _MAX_EXTRACT_BYTES:
-                return None, None
-            data = resp.content
-    except Exception:
-        return None, None
-    return await asyncio.to_thread(_extract_xlsx_text, data, filename)
+        data = await _download_capped(file_url, cap_bytes)
+    except _DownloadTooLarge:
+        return None, None, _TOO_LARGE_MSG
+    except RuntimeError:
+        return None, None, _EXTRACT_FAIL_MSG
+    desc, meta = await asyncio.to_thread(_extract_xlsx_text, data, filename)
+    return desc, meta, None
 
 
 def _extract_xlsx_text(data: bytes, filename: str) -> tuple[str, dict]:
@@ -417,7 +510,7 @@ def _extract_xlsx_text(data: bytes, filename: str) -> tuple[str, dict]:
     except Exception:
         return f"Excel文件（无法解析）：{filename}", meta
 
-    max_chars = settings.pdf_max_extract_chars
+    max_chars = settings.extract_char_budget
     parts: list[str] = []
     sheet_count = 0
     empty_sheets = 0
