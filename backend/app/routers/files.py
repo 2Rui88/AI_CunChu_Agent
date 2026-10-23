@@ -1,7 +1,9 @@
 import io
+import asyncio
 import hashlib
-from fastapi import APIRouter, UploadFile, File, Form, HTTPException
+from fastapi import APIRouter, UploadFile, File, Form
 from sqlalchemy import select
+from sqlalchemy.exc import IntegrityError
 from app.database import Session
 from app.models import FileInfo, UserFileList, UserFileCount
 from app.dependencies import check_token
@@ -42,7 +44,21 @@ async def md5_check(body: dict):
         if existing:
             existing.count += 1
             db.add(UserFileList(user=user, md5=md5, file_name=filename))
-            await db.commit()
+            # 秒传同样计入用户文件数（与上传/删除路径对齐，否则计数漂移）
+            result = await db.execute(
+                select(UserFileCount).where(UserFileCount.user == user)
+            )
+            ufc = result.scalar()
+            if ufc:
+                ufc.count += 1
+            else:
+                db.add(UserFileCount(user=user, count=1))
+            try:
+                await db.commit()
+            except IntegrityError:
+                # 并发秒传同一文件：唯一约束冲突，按"已存在"处理
+                await db.rollback()
+                return {"code": 5}
             return {"code": 0}
 
         return {"code": 1}
@@ -58,14 +74,14 @@ async def upload(
     if not await check_token(user, token):
         return {"code": 4}
 
-    ensure_bucket()
+    await asyncio.to_thread(ensure_bucket)
 
     content = await file.read()
     file_size = len(content)
     suffix = _get_suffix(file.filename)
 
     # 服务端计算 MD5，客户端上报值仅作比对，防止伪造 md5 覆盖他人文件
-    actual_md5 = hashlib.md5(content).hexdigest()
+    actual_md5 = await asyncio.to_thread(lambda: hashlib.md5(content).hexdigest())
     if md5 and md5.lower() != actual_md5:
         return {"code": 1, "msg": "md5 mismatch"}
     md5 = actual_md5
@@ -91,7 +107,9 @@ async def upload(
         else:
             # 对象名使用完整 md5：同内容才可能同名，避免 md5[:6] 前缀碰撞覆盖他人文件
             object_name = f"{md5}/{file.filename}"
-            client.put_object(BUCKET, object_name, io.BytesIO(content), file_size)
+            await asyncio.to_thread(
+                client.put_object, BUCKET, object_name, io.BytesIO(content), file_size
+            )
             file_id = object_name
             url = f"/files/{BUCKET}/{object_name}"
 
@@ -115,7 +133,12 @@ async def upload(
         else:
             db.add(UserFileCount(user=user, count=1))
 
-        await db.commit()
+        try:
+            await db.commit()
+        except IntegrityError:
+            # 并发上传相同内容：另一请求已建 file_info，按"已存在"处理而非 500
+            await db.rollback()
+            return {"code": 5}
 
     return {"code": 0}
 

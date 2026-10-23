@@ -7,9 +7,11 @@ Redis Key:
   SHARE_PIC_COUNT_*  —— 用户图床数量
 """
 import hashlib
+import asyncio
 import secrets
 from fastapi import APIRouter, Request
 from sqlalchemy import select, update, delete
+from sqlalchemy.exc import IntegrityError
 from app.database import Session
 from app.models import (
     UserFileList, ShareFileList, FileInfo,
@@ -170,7 +172,7 @@ async def _del_file(user: str, md5_val: str, filename: str) -> dict:
             # 没有任何用户引用时，物理删除文件
             if fi.count <= 0:
                 try:
-                    client.remove_object(BUCKET, fi.file_id)
+                    await asyncio.to_thread(client.remove_object, BUCKET, fi.file_id)
                 except Exception:
                     pass
                 await db.delete(fi)
@@ -201,7 +203,7 @@ async def _pv_file(user: str, md5_val: str, filename: str) -> dict:
         ufl.pv = (ufl.pv or 0) + 1
         shared = ufl.shared_status
 
-        # 如果已分享，同步更新 share_file_list 和 Redis ZSET
+        # 如果已分享，同步更新 share_file_list（自增 +1，而非覆盖为文件主累计值）
         if shared == 1:
             await db.execute(
                 update(ShareFileList)
@@ -210,7 +212,7 @@ async def _pv_file(user: str, md5_val: str, filename: str) -> dict:
                     ShareFileList.md5 == md5_val,
                     ShareFileList.file_name == filename,
                 )
-                .values(pv=ufl.pv)
+                .values(pv=ShareFileList.pv + 1)
             )
 
         await db.commit()
@@ -226,12 +228,35 @@ async def _pv_file(user: str, md5_val: str, filename: str) -> dict:
 #  sharefiles —— 共享广场 / 下载排行
 # ============================================================
 
+async def _rebuild_public_zset_if_empty():
+    """Redis 排行榜丢失（清空/重启丢数据）时，从 MySQL 真值懒重建"""
+    try:
+        if await redis.zcard(FILE_PUBLIC_ZSET) > 0:
+            return
+        async with Session() as db:
+            rows = (await db.execute(
+                select(ShareFileList).order_by(ShareFileList.pv.desc()).limit(500)
+            )).scalars().all()
+        if not rows:
+            return
+        pipe = redis.pipeline()
+        for r in rows:
+            fileid = f"{r.md5}{r.file_name}"
+            pipe.zadd(FILE_PUBLIC_ZSET, {fileid: r.pv or 0})
+            pipe.hset(FILE_NAME_HASH, fileid, r.file_name)
+        await pipe.execute()
+    except Exception:
+        pass  # 重建失败不影响本次返回（zset 为空 → 空列表）
+
+
 @router.post("/sharefiles")
 async def sharefiles(request: Request, body: dict):
     """共享文件列表：cmd=normal 普通列表, cmd=pvdesc 按下载量降序"""
     cmd = request.query_params.get("cmd", body.get("cmd", "normal"))
 
     if cmd == "pvdesc":
+        # 排行榜以 MySQL 为真值来源：Redis 丢失时懒重建
+        await _rebuild_public_zset_if_empty()
         # 从 Redis ZSET 获取下载排行
         fileids = await redis.zrevrange(FILE_PUBLIC_ZSET, 0, 9)
         files = []
@@ -294,16 +319,36 @@ async def dealsharefile(request: Request, body: dict):
     elif cmd == "cancel":
         return await _cancel_share(user, md5_val, filename)
     elif cmd == "pv":
-        fileid = f"{md5_val}{filename}"
-        await redis.zincrby(FILE_PUBLIC_ZSET, 1, fileid)
+        # 下载计数：MySQL（真值）与 Redis（排行榜缓存）同步自增
+        async with Session() as db:
+            await db.execute(
+                update(ShareFileList)
+                .where(
+                    ShareFileList.md5 == md5_val,
+                    ShareFileList.file_name == filename,
+                )
+                .values(pv=ShareFileList.pv + 1)
+            )
+            await db.commit()
+        await redis.zincrby(FILE_PUBLIC_ZSET, 1, f"{md5_val}{filename}")
         return {"code": 0}
 
     return {"code": 1}
 
 
 async def _save_shared(user: str, md5_val: str, filename: str) -> dict:
-    """转存共享文件到自己的文件列表"""
+    """转存共享文件到自己的文件列表（仅限确已出现在共享广场的文件）"""
     async with Session() as db:
+        # 必须确实处于共享状态，防止凭 md5+文件名转存他人私有文件
+        shared = await db.execute(
+            select(ShareFileList).where(
+                ShareFileList.md5 == md5_val,
+                ShareFileList.file_name == filename,
+            ).limit(1)
+        )
+        if not shared.scalar():
+            return {"code": 1, "msg": "file not shared"}
+
         # 检查是否已经拥有
         result = await db.execute(
             select(UserFileList).where(
@@ -333,7 +378,11 @@ async def _save_shared(user: str, md5_val: str, filename: str) -> dict:
         else:
             db.add(UserFileCount(user=user, count=1))
 
-        await db.commit()
+        try:
+            await db.commit()
+        except IntegrityError:
+            await db.rollback()
+            return {"code": 5}
 
     return {"code": 0}
 
