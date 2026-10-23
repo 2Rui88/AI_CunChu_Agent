@@ -266,6 +266,10 @@ async def _generate_description(db, md5_val: str, filename: str, file_type: str,
         if fi and fi.url:
             public_url = _build_public_url(fi.url)
             desc = await describe_image(api_key, public_url)
+            if not desc or desc == "无法描述此图片":
+                # VL 失败时退化为结构化存根（打"未索引内容"标），
+                # 避免占位文案被当作真实内容向量化入库
+                return _make_stub_description(ft, filename, fi.size, "AI 视觉描述失败"), None, True
             return desc, None, False
         return f"图片文件：{filename}", None, False
 
@@ -914,7 +918,11 @@ async def ai_search(body: dict):
 
     query = body.get("query", "")
     api_key = body.get("api_key", "")
-    top_k = body.get("top_k", 10)
+    # top_k 钳制到 1..50，防异常值放大检索与重排成本
+    try:
+        top_k = max(1, min(int(body.get("top_k", 10) or 10), 50))
+    except (TypeError, ValueError):
+        top_k = 10
 
     if not query or not api_key:
         return {"code": 1, "msg": "missing query or api_key"}

@@ -546,7 +546,8 @@ def chunk_text(file_type: str, text: str,
     try:
         chunks = chunker.chunk(text, max_chars, metadata=metadata)
         if not chunks:
-            return [Chunk(index=0, text=text, context_label="")]
+            return [Chunk(index=0, text=text[:max_chars], context_label="")]
         return chunks
     except Exception:
-        return [Chunk(index=0, text=text, context_label="")]
+        # 异常兜底同样截断到 max_chars，避免超长文本绕过上限导致 embedding 失败
+        return [Chunk(index=0, text=text[:max_chars], context_label="")]

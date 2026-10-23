@@ -23,8 +23,15 @@ BUCKET = settings.minio_bucket
 _policy_migration_done = False
 
 
+# 对外签名客户端（按配置构建一次，进程内复用；签名是本地计算，无需每次新建）
+_sign_client_instance: Minio | None = None
+
+
 def _sign_client() -> Minio:
     """面向外网的签名客户端：签出的 URL 走 nginx /files/ 代理，Host 与签名一致"""
+    global _sign_client_instance
+    if _sign_client_instance is not None:
+        return _sign_client_instance
     if settings.public_server_ip:
         endpoint = f"{settings.public_server_ip}:{settings.public_server_port or '443'}"
         secure = settings.public_server_ssl
@@ -32,12 +39,13 @@ def _sign_client() -> Minio:
         # 未配置公网地址（本地开发）：退回 MinIO 直连端点
         endpoint = settings.minio_endpoint
         secure = False
-    return Minio(
+    _sign_client_instance = Minio(
         endpoint,
         access_key=settings.minio_access_key,
         secret_key=settings.minio_secret_key,
         secure=secure,
     )
+    return _sign_client_instance
 
 
 def db_url_to_object(db_url: str) -> str:
