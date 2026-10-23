@@ -7,6 +7,7 @@ from sqlalchemy.exc import IntegrityError
 from app.database import Session
 from app.models import FileInfo, UserFileList, UserFileCount
 from app.dependencies import check_token
+from app.file_ops import attach_file_to_user
 from app.minio_client import client, BUCKET, ensure_bucket, presign_from_db_url
 
 router = APIRouter(prefix="/api", tags=["files"])
@@ -56,9 +57,10 @@ async def md5_check(body: dict):
             try:
                 await db.commit()
             except IntegrityError:
-                # 并发秒传同一文件：唯一约束冲突，按"已存在"处理
+                # 并发秒传触发唯一约束（如 user_file_count.user）：
+                # 回滚后补建本用户关联，避免"败方"文件凭空消失
                 await db.rollback()
-                return {"code": 5}
+                return {"code": 0 if await attach_file_to_user(user, md5, filename) else 5}
             return {"code": 0}
 
         return {"code": 1}
@@ -136,8 +138,11 @@ async def upload(
         try:
             await db.commit()
         except IntegrityError:
-            # 并发上传相同内容：另一请求已建 file_info，按"已存在"处理而非 500
+            # 并发上传相同内容：另一请求已抢先创建 file_info。
+            # 回滚后补建本用户关联与计数（对象存储中同内容对象幂等），而非直接报"已存在"
             await db.rollback()
+            if await attach_file_to_user(user, md5, file.filename):
+                return {"code": 0}
             return {"code": 5}
 
     return {"code": 0}
@@ -155,8 +160,15 @@ async def myfiles(body: dict):
     if cmd != "normal":
         return {"code": 1}
 
-    start = body.get("start", 0)
-    count = body.get("count", 20)
+    # 分页参数钳制，防异常值打穿查询
+    try:
+        start = max(0, int(body.get("start", 0) or 0))
+    except (TypeError, ValueError):
+        start = 0
+    try:
+        count = max(1, min(int(body.get("count", 20) or 20), 500))
+    except (TypeError, ValueError):
+        count = 20
 
     async with Session() as db:
         result = await db.execute(

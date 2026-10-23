@@ -13,6 +13,7 @@ from urllib.parse import parse_qs
 from fastapi import APIRouter, Request
 from sqlalchemy.exc import IntegrityError
 from app.dependencies import check_token
+from app.file_ops import attach_file_to_user
 from app.redis_client import redis
 from app.database import Session
 from app.models import FileInfo, UserFileList, UserFileCount
@@ -20,7 +21,8 @@ from app.minio_client import client, BUCKET, ensure_bucket
 
 router = APIRouter(prefix="/api", tags=["chunk"])
 
-CHUNK_TEMP_DIR = "/tmp/chunks"
+# 挂载在 docker 卷（chunk_data:/data/chunks）上，容器重启后分片仍可用于断点续传
+CHUNK_TEMP_DIR = "/data/chunks"
 
 # 合法 md5 为 32 位十六进制；同时杜绝 "../" 之类的路径穿越
 _MD5_RE = re.compile(r"^[0-9a-fA-F]{32}$")
@@ -274,13 +276,13 @@ async def chunk_merge(body: dict):
         try:
             await db.commit()
         except IntegrityError:
-            # 并发合并相同内容：另一请求已建 file_info，按"已存在"处理而非 500
+            # 并发合并相同内容：另一请求已抢先创建 file_info —— 补建本用户关联而非丢弃
             await db.rollback()
             import shutil
             os.remove(merged_path)
             shutil.rmtree(chunk_dir, ignore_errors=True)
             await redis.delete(redis_key)
-            return {"code": 5}
+            return {"code": 0 if await attach_file_to_user(user, md5_val, filename) else 5}
 
     # 清理 Redis 和临时文件
     await redis.delete(redis_key)

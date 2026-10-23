@@ -1,14 +1,11 @@
 """
-文件管理模块 —— 分享、删除、下载计数、共享广场、转存、图床分享
+文件管理模块 —— 分享、删除、下载计数、共享广场、转存
 
 Redis Key:
-  FILE_PUBLIC_ZSET   —— 共享文件有序集合 (score = 下载量)
+  FILE_PUBLIC_ZSET   —— 共享文件有序集合 (score = 下载量，缓存，真值在 MySQL)
   FILE_NAME_HASH     —— fileid -> filename 映射
-  SHARE_PIC_COUNT_*  —— 用户图床数量
 """
-import hashlib
 import asyncio
-import secrets
 from fastapi import APIRouter, Request
 from sqlalchemy import select, update, delete
 from sqlalchemy.exc import IntegrityError
@@ -16,7 +13,6 @@ from app.database import Session
 from app.models import (
     UserFileList, ShareFileList, FileInfo,
     UserFileCount, UserFileAiDesc,
-    SharePictureList,
 )
 from app.dependencies import check_token
 from app.redis_client import redis
@@ -319,8 +315,17 @@ async def dealsharefile(request: Request, body: dict):
     elif cmd == "cancel":
         return await _cancel_share(user, md5_val, filename)
     elif cmd == "pv":
-        # 下载计数：MySQL（真值）与 Redis（排行榜缓存）同步自增
+        # 下载计数：MySQL（真值）与 Redis（排行榜缓存）同步自增。
+        # 先确认文件确已共享，防止对任意 md5 的 pv 请求在 ZSET 里制造幽灵条目
         async with Session() as db:
+            shared = await db.execute(
+                select(ShareFileList).where(
+                    ShareFileList.md5 == md5_val,
+                    ShareFileList.file_name == filename,
+                ).limit(1)
+            )
+            if not shared.scalar():
+                return {"code": 1, "msg": "file not shared"}
             await db.execute(
                 update(ShareFileList)
                 .where(
@@ -427,67 +432,3 @@ async def _cancel_share(user: str, md5_val: str, filename: str) -> dict:
     await redis.hdel(FILE_NAME_HASH, fileid)
 
     return {"code": 0}
-
-
-# ============================================================
-#  sharepic —— 图床分享（生成提取码）
-# ============================================================
-
-@router.post("/sharepic")
-async def sharepic(body: dict):
-    """
-    图床分享 —— 为图片生成唯一的提取码，存储到 share_picture_list。
-    返回 8 位随机数字提取码供用户分享。
-    """
-    user = body.get("user", "")
-    token = body.get("token", "")
-    if not await check_token(user, token):
-        return {"code": 4}
-
-    md5_val = body.get("md5", "")
-    filename = body.get("filename", "")
-    if not md5_val or not filename:
-        return {"code": 1}
-
-    # 图床 URL 的 MD5（用于唯一标识图床链接）
-    urlmd5 = hashlib.md5(f"{user}/{md5_val}/{filename}".encode()).hexdigest()
-
-    async with Session() as db:
-        # 检查是否已分享过该图床
-        result = await db.execute(
-            select(SharePictureList).where(
-                SharePictureList.user == user,
-                SharePictureList.filemd5 == md5_val,
-                SharePictureList.urlmd5 == urlmd5,
-            )
-        )
-        existing = result.scalar()
-        if existing:
-            # 已存在，直接返回原来的提取码
-            return {"code": 0, "key": existing.key}
-
-        # 生成 8 位随机数字提取码
-        key = "".join([str(secrets.randbelow(10)) for _ in range(8)])
-
-        db.add(SharePictureList(
-            user=user,
-            filemd5=md5_val,
-            file_name=filename,
-            urlmd5=urlmd5,
-            key=key,
-        ))
-
-        # 更新用户图床计数
-        count_key = f"SHARE_PIC_COUNT_{user}"
-        result = await db.execute(
-            select(UserFileCount).where(UserFileCount.user == count_key)
-        )
-        ufc = result.scalar()
-        if ufc:
-            ufc.count += 1
-        else:
-            db.add(UserFileCount(user=count_key, count=1))
-
-        await db.commit()
-
-    return {"code": 0, "key": key}
