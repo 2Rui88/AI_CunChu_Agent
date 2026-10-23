@@ -9,7 +9,7 @@ import {
 import styled from '@emotion/styled';
 import { useAuth } from '../contexts/AuthContext';
 import { fetchUserImages, uploadImage, deleteImage, shareFile, cancelShareFile, pvFile } from '../services/images';
-import { describeFile } from '../services/ai';
+import { describeFileByMd5 } from '../services/ai';
 import { IMAGE_EXTS, formatFileSize, getFileIcon } from '../utils/format';
 
 const UploadCard = styled(Card)`
@@ -87,7 +87,10 @@ const FileList = () => {
         message.success('上传成功！');
       }
       const apiKey = localStorage.getItem('dashscope_api_key_' + user.username) || '';
-      describeFile(file, user, apiKey).catch(() => {});
+      if (result.md5) {
+        const ext = (file.name.split('.').pop() || '').toLowerCase();
+        describeFileByMd5(result.md5, file.name, ext, user, apiKey).catch(() => {});
+      }
       fetchFiles();
     } catch (error) {
       if (error.tokenExpired) {

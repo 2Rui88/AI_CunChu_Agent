@@ -1,5 +1,4 @@
 import { API_CONFIG } from '../config';
-import SparkMD5 from 'spark-md5';
 
 const AI_ENDPOINT = `${API_CONFIG.BASE_URL}/api/ai`;
 const API_KEY_STORAGE_PREFIX = 'dashscope_api_key_';
@@ -28,59 +27,9 @@ export const saveApiKey = async (key, user) => {
   return { code: 0, msg: 'ok' };
 };
 
-// 计算文件 MD5（与 images.js 中一致）
-const calculateMD5 = (file) => {
-  return new Promise((resolve, reject) => {
-    const reader = new FileReader();
-    reader.onload = (e) => {
-      const spark = new SparkMD5.ArrayBuffer();
-      spark.append(e.target.result);
-      resolve(spark.end());
-    };
-    reader.onerror = reject;
-    reader.readAsArrayBuffer(file);
-  });
-};
-
-/**
- * 上传后异步调用 AI 生成文件描述 + 向量
- * 失败不影响上传流程
- */
-export const describeFile = async (file, user, apiKey) => {
-  try {
-    const md5 = await calculateMD5(file);
-    const ext = file.name.split('.').pop() || '';
-
-    const body = {
-      user: user.username,
-      token: user.token,
-      md5: md5,
-      filename: file.name,
-      type: ext.toLowerCase()
-    };
-    if (apiKey) body.api_key = apiKey;
-
-    const response = await fetch(`${AI_ENDPOINT}/describe`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify(body)
-    });
-
-    const data = await response.json();
-    if (data.code === 0) {
-      console.log('AI describe success:', file.name);
-    } else {
-      console.warn('AI describe failed:', data.msg);
-    }
-    return data;
-  } catch (error) {
-    console.warn('AI describe error (non-blocking):', error);
-    return null;
-  }
-};
-
 /**
  * 对已有文件重新生成 AI 描述（通过 md5）
+ * 注：文件 md5 由上传流程（images.js）计算并回传，此处不再重复计算
  */
 export const describeFileByMd5 = async (md5, filename, type, user, apiKey, skipRebuild = false) => {
   const body = {

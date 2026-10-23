@@ -117,15 +117,15 @@ const uploadChunked = async (file, user, md5, onProgress) => {
     md5,
     filename: file.name,
   });
-  if (merge.code === 5) return { alreadyExists: true };
+  if (merge.code === 5) return { alreadyExists: true, md5 };
   if (merge.code !== 0) throw new Error(merge.msg || '分片合并失败');
   if (onProgress) onProgress(100);
-  return {};
+  return { md5 };
 };
 
 /**
  * 上传文件：秒传检测 → (大文件) 分片上传 / (小文件) 普通上传
- * 返回 {alreadyExists?} / {instant?} / {}
+ * 返回 {alreadyExists?, instant?, md5} —— md5 供 AI 描述等后续步骤复用，避免重复计算
  */
 export const uploadImage = async (file, user, onProgress) => {
   const md5 = await calculateMD5(file, onProgress);
@@ -137,8 +137,8 @@ export const uploadImage = async (file, user, onProgress) => {
     md5,
     fileName: file.name,
   });
-  if (check.code === 5) return { alreadyExists: true };
-  if (check.code === 0) return { instant: true };
+  if (check.code === 5) return { alreadyExists: true, md5 };
+  if (check.code === 0) return { instant: true, md5 };
 
   if (file.size > API_CONFIG.CHUNK_THRESHOLD) {
     return uploadChunked(file, user, md5, onProgress);
@@ -157,10 +157,10 @@ export const uploadImage = async (file, user, onProgress) => {
     err.tokenExpired = true;
     throw err;
   }
-  if (data.code === 5) return { alreadyExists: true };
+  if (data.code === 5) return { alreadyExists: true, md5 };
   if (data.code !== 0) throw new Error(data.msg || '上传失败');
   if (onProgress) onProgress(100);
-  return {};
+  return { md5 };
 };
 
 /** dealfile 通用调用（share / del / pv） */
