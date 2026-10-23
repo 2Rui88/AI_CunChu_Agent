@@ -2,6 +2,7 @@ import logging
 from contextlib import asynccontextmanager
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
+from app.config import settings
 from app.routers import auth, files, chunk, share, ai, agent
 from app.database import init_db
 from app.minio_client import ensure_bucket
@@ -25,8 +26,9 @@ app = FastAPI(title="AI-YunCunChu", lifespan=lifespan)
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=True,
+    # 收敛为白名单（生产同源部署不需要跨域；认证走 body 内 token，无 cookie 依赖）
+    allow_origins=[o.strip() for o in settings.cors_origins.split(",") if o.strip()],
+    allow_credentials=False,
     allow_methods=["*"],
     allow_headers=["*"],
 )

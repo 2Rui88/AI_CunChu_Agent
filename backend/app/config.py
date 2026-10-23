@@ -59,6 +59,14 @@ class Settings(BaseSettings):
     max_context_messages: int = 20
     max_tool_calls_per_turn: int = 5
 
+    # ── CORS ──
+    # 允许跨域的前端来源（逗号分隔）。生产同源部署（Nginx 同域反代）无需跨域；
+    # 默认放行本地开发常用地址，正式环境用环境变量 CORS_ORIGINS 覆盖。
+    cors_origins: str = (
+        "http://localhost:3000,http://localhost:3456,"
+        "http://127.0.0.1:3000,http://127.0.0.1:3456"
+    )
+
     model_config = {"env_file": ".env"}
 
 
