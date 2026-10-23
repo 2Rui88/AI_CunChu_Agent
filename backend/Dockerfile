@@ -11,7 +11,7 @@ COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
 COPY . .
-RUN mkdir -p /data/faiss/users /tmp/faiss_locks
+RUN mkdir -p /data/faiss/users /data/chunks /tmp/faiss_locks
 
 EXPOSE 8000
 

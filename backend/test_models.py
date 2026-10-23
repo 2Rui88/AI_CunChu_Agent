@@ -1,5 +1,6 @@
-"""验证 ORM 模型增删改查"""
+"""验证 ORM 模型增删改查（幂等：先清理历史测试数据，可反复执行）"""
 import asyncio
+from sqlalchemy import delete, select
 from app.database import Session, init_db, close_db
 from app.models import UserInfo, FileInfo, UserFileList
 
@@ -8,6 +9,10 @@ async def main():
     await init_db()
 
     async with Session() as db:
+        # 幂等：清掉上次运行可能残留的测试数据
+        await db.execute(delete(UserInfo).where(UserInfo.user_name == "test_crud"))
+        await db.commit()
+
         # CREATE
         user = UserInfo(
             user_name="test_crud",
@@ -21,7 +26,6 @@ async def main():
         print(f"  CREATE  user: id={user.id}, name={user.user_name}")
 
         # READ
-        from sqlalchemy import select
         result = await db.execute(
             select(UserInfo).where(UserInfo.user_name == "test_crud")
         )

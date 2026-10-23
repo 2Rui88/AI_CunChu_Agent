@@ -6,7 +6,8 @@ services:
     # 服务端默认字符集设为 utf8mb4，保证中文文件名/描述正常存储
     command: --character-set-server=utf8mb4 --collation-server=utf8mb4_unicode_ci
     ports:
-      - "3307:3306"
+      # 仅绑定本机回环供调试，不对公网暴露 root 端口
+      - "127.0.0.1:3307:3306"
     volumes:
       - mysql_data:/var/lib/mysql
       - ./mysql/init.sql:/docker-entrypoint-initdb.d/init.sql
@@ -104,6 +105,8 @@ services:
       PUBLIC_SERVER_SSL: ${PUBLIC_SERVER_SSL:-true}
     volumes:
       - faiss_data:/data/faiss
+      # 分片临时目录挂卷：容器重启后分片仍在，断点续传才真正可用
+      - chunk_data:/data/chunks
     networks:
       my_net:
         ipv4_address: 172.30.0.6
@@ -120,3 +123,4 @@ volumes:
   mysql_data:
   minio_data:
   faiss_data:
+  chunk_data:
