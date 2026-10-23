@@ -1,8 +1,8 @@
 import hashlib
 import secrets
 import bcrypt
-from fastapi import APIRouter
-from pydantic import BaseModel
+from fastapi import APIRouter, Request
+from pydantic import BaseModel, Field
 from sqlalchemy import select
 from app.database import Session
 from app.models import UserInfo
@@ -15,16 +15,35 @@ BCRYPT_ALGO = "bcrypt"
 
 
 class RegRequest(BaseModel):
-    username: str
-    nick_name: str
-    password: str
-    phone: str = ""
-    email: str = ""
+    # 用户名限制字符集：字母/数字/下划线/连字符，3-32 位
+    username: str = Field(min_length=3, max_length=32, pattern=r"^[A-Za-z0-9_-]+$")
+    nick_name: str = Field(min_length=1, max_length=32)
+    # bcrypt 只取前 72 字节，超长直接拒绝
+    password: str = Field(min_length=6, max_length=72)
+    phone: str = Field(default="", max_length=16)
+    email: str = Field(default="", max_length=64)
 
 
 class LoginRequest(BaseModel):
-    user: str
-    pwd: str
+    user: str = Field(min_length=1, max_length=32)
+    pwd: str = Field(min_length=1, max_length=72)
+
+
+def _client_ip(request: Request) -> str:
+    """取真实客户端 IP（Nginx 反代场景读 X-Forwarded-For 首段）"""
+    fwd = request.headers.get("x-forwarded-for", "")
+    if fwd:
+        return fwd.split(",")[0].strip()
+    return request.client.host if request.client else "unknown"
+
+
+async def _rate_limit(bucket: str, ident: str, limit: int, window: int) -> bool:
+    """固定窗口限流：超限返回 False"""
+    key = f"rl:{bucket}:{ident}"
+    n = await redis.incr(key)
+    if n == 1:
+        await redis.expire(key, window)
+    return n <= limit
 
 
 def _make_hash(pwd_md5: str, salt: str) -> str:
@@ -45,7 +64,11 @@ def _check_bcrypt(password: str, stored: str) -> bool:
 
 
 @router.post("/reg")
-async def register(body: RegRequest):
+async def register(body: RegRequest, request: Request):
+    # 注册限流：每 IP 每小时 5 次
+    if not await _rate_limit("reg", _client_ip(request), 5, 3600):
+        return {"code": 7, "msg": "too many registrations"}
+
     async with Session() as db:
         result = await db.execute(
             select(UserInfo).where(UserInfo.user_name == body.username)
@@ -78,7 +101,13 @@ async def register(body: RegRequest):
 
 
 @router.post("/login")
-async def login(body: LoginRequest):
+async def login(body: LoginRequest, request: Request):
+    # 登录限流：单用户名 5 分钟 10 次 + 单 IP 5 分钟 30 次，挡住暴力试密码
+    if not await _rate_limit("login-user", body.user, 10, 300):
+        return {"code": 3, "msg": "too many attempts"}
+    if not await _rate_limit("login-ip", _client_ip(request), 30, 300):
+        return {"code": 3, "msg": "too many attempts"}
+
     async with Session() as db:
         result = await db.execute(
             select(UserInfo).where(UserInfo.user_name == body.user)
