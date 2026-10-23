@@ -31,7 +31,7 @@ export const saveApiKey = async (key, user) => {
  * 对已有文件重新生成 AI 描述（通过 md5）
  * 注：文件 md5 由上传流程（images.js）计算并回传，此处不再重复计算
  */
-export const describeFileByMd5 = async (md5, filename, type, user, apiKey, skipRebuild = false) => {
+export const describeFileByMd5 = async (md5, filename, type, user, apiKey) => {
   const body = {
     user: user.username,
     token: user.token,
@@ -40,7 +40,6 @@ export const describeFileByMd5 = async (md5, filename, type, user, apiKey, skipR
     type: type,
     force: true
   };
-  if (skipRebuild) body.skip_rebuild = true;
   if (apiKey) body.api_key = apiKey;
 
   const response = await fetch(`${AI_ENDPOINT}/describe`, {

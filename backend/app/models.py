@@ -56,19 +56,6 @@ class ShareFileList(Base):
     create_time = Column(TIMESTAMP, server_default=text("CURRENT_TIMESTAMP"))
 
 
-class SharePictureList(Base):
-    __tablename__ = "share_picture_list"
-
-    id = Column(Integer, primary_key=True, autoincrement=True)
-    user = Column(String(32), nullable=False)
-    filemd5 = Column(String(256), nullable=False)
-    file_name = Column(String(128))
-    urlmd5 = Column(String(256), nullable=False)
-    key = Column(String(8), nullable=False)
-    pv = Column(Integer, default=1)
-    create_time = Column(TIMESTAMP, server_default=text("CURRENT_TIMESTAMP"))
-
-
 class UserFileCount(Base):
     __tablename__ = "user_file_count"
 

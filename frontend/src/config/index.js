@@ -9,7 +9,6 @@ export const API_CONFIG = {
     DEAL_FILE: '/api/dealfile',
     DEAL_SHARE_FILE: '/api/dealsharefile',
     SHARE_FILES: '/api/sharefiles',
-    SHARE_PIC: '/api/sharepic',
     CHUNK_INIT: '/api/chunk_init',
     CHUNK_UPLOAD: '/api/chunk_upload',
     CHUNK_MERGE: '/api/chunk_merge',

@@ -48,19 +48,6 @@ CREATE TABLE IF NOT EXISTS share_file_list (
     KEY idx_sfl_md5 (md5(191))
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
 
-CREATE TABLE IF NOT EXISTS share_picture_list (
-    id INT AUTO_INCREMENT PRIMARY KEY,
-    user VARCHAR(32) NOT NULL,
-    filemd5 VARCHAR(256) NOT NULL,
-    file_name VARCHAR(128),
-    urlmd5 VARCHAR(256) NOT NULL,
-    `key` VARCHAR(8) NOT NULL,
-    pv INT DEFAULT 1,
-    create_time TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-    KEY idx_spl_urlmd5 (urlmd5(191)),
-    KEY idx_spl_key (`key`)
-) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
-
 CREATE TABLE IF NOT EXISTS user_file_count (
     id INT AUTO_INCREMENT PRIMARY KEY,
     user VARCHAR(128) NOT NULL UNIQUE,
