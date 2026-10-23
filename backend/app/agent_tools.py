@@ -66,7 +66,11 @@ async def tool_search_files(username: str, **kwargs) -> dict:
     LLM 参数: query (str), top_k (int, 可选, 默认5)
     """
     query = kwargs.get("query", "")
-    top_k = int(kwargs.get("top_k", 5))
+    # top_k 钳制（LLM 给出的参数不可信），过量召回后按 top_k 截断输出
+    try:
+        top_k = max(1, min(int(kwargs.get("top_k", 5) or 5), 20))
+    except (TypeError, ValueError):
+        top_k = 5
     api_key = kwargs.get("api_key", "")
 
     if not query or not api_key:
@@ -92,6 +96,8 @@ async def tool_search_files(username: str, **kwargs) -> dict:
             for faiss_id, score in results:
                 if score < 0.45:
                     continue
+                if len(files) >= top_k:
+                    break
                 result = await db.execute(
                     select(UserFileAiDesc, UserFileList, FileInfo)
                     .join(UserFileList,
@@ -332,6 +338,13 @@ async def tool_delete_file(username: str, **kwargs) -> dict:
                         ShareFileList.file_name == ufl.file_name,
                     )
                 )
+                # 公共分享计数 -1（与 share.py _del_file 对齐，修正历史漂移）
+                result = await db.execute(
+                    select(UserFileCount).where(UserFileCount.user == "FILE_PUBLIC_COUNT")
+                )
+                ufc_pub = result.scalar()
+                if ufc_pub and ufc_pub.count > 0:
+                    ufc_pub.count -= 1
                 fileid = f"{ufl.md5}{ufl.file_name}"
                 try:
                     await redis.zrem("FILE_PUBLIC_ZSET", fileid)

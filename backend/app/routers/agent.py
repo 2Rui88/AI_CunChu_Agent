@@ -164,12 +164,12 @@ async def _load_messages(user: str, conv_id: str) -> list[dict]:
 
 
 async def _save_messages(user: str, conv_id: str, messages: list[dict]):
-    """保存对话历史（1小时过期）"""
+    """保存对话历史（1小时过期；按配置截断上下文条数）"""
     key = f"agent:conv:{user}:{conv_id}"
     data = json.dumps({
         "conv_id": conv_id,
         "updated_at": time.strftime("%Y-%m-%d %H:%M:%S"),
-        "messages": messages[-50:],
+        "messages": messages[-settings.max_context_messages:],
     }, ensure_ascii=False)
     await redis.setex(key, settings.conversation_ttl_seconds, data)
 

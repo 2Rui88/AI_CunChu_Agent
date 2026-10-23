@@ -74,12 +74,15 @@ async def register(body: RegRequest, request: Request):
             select(UserInfo).where(UserInfo.user_name == body.username)
         )
         if result.scalar():
+            # 时序对齐：失败路径同样执行一次 bcrypt 哈希，防止用响应时间探测用户名是否存在
+            _hash_bcrypt(body.password)
             return {"code": 2, "msg": "username exists"}
 
         result = await db.execute(
             select(UserInfo).where(UserInfo.nick_name == body.nick_name)
         )
         if result.scalar():
+            _hash_bcrypt(body.password)
             return {"code": 6, "msg": "nickname exists"}
 
         # salt 仅为满足列非空保留；bcrypt 哈希内含盐
@@ -132,4 +135,6 @@ async def login(body: LoginRequest, request: Request):
 
         token = secrets.token_hex(16)
         await redis.setex(f"token:{user.user_name}", 86400, token)
+        # 登录成功即清除该用户名的失败计数，避免正常频繁登录被限流误伤
+        await redis.delete(f"rl:login-user:{body.user}")
         return {"code": 0, "token": token}
