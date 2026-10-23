@@ -7,9 +7,11 @@ Redis Key: chunk:<user>:<md5> Hash 存储分片元信息（按用户隔离）
 """
 import os
 import re
+import asyncio
 import hashlib
 from urllib.parse import parse_qs
 from fastapi import APIRouter, Request
+from sqlalchemy.exc import IntegrityError
 from app.dependencies import check_token
 from app.redis_client import redis
 from app.database import Session
@@ -40,6 +42,24 @@ def _chunk_dir(user: str, md5_val: str) -> str:
     """分片临时目录（按用户隔离；用户名哈希后拼路径，杜绝特殊字符进入路径）"""
     user_dir = hashlib.md5(user.encode()).hexdigest()
     return os.path.join(CHUNK_TEMP_DIR, user_dir, md5_val)
+
+
+def _merge_chunk_files(chunk_dir: str, chunk_count: int, merged_path: str):
+    """顺序合并分片（1MB 块流式读写，避免整段读入内存）"""
+    with open(merged_path, "wb") as out:
+        for i in range(chunk_count):
+            with open(os.path.join(chunk_dir, str(i)), "rb") as f:
+                for block in iter(lambda: f.read(1024 * 1024), b""):
+                    out.write(block)
+
+
+def _md5_of_file(path: str) -> str:
+    """流式计算文件 MD5（1MB 块），大文件不会撑爆内存"""
+    h = hashlib.md5()
+    with open(path, "rb") as f:
+        for block in iter(lambda: f.read(1024 * 1024), b""):
+            h.update(block)
+    return h.hexdigest()
 
 
 def _get_suffix(filename: str) -> str:
@@ -185,19 +205,15 @@ async def chunk_merge(body: dict):
     if len(uploaded) != chunk_count:
         return {"code": 1, "msg": f"分片不完整: {len(uploaded)}/{chunk_count}"}
 
-    # 合并分片到完整文件（目录按用户隔离，避免并发合并互相覆盖）
+    # 合并分片到完整文件（目录按用户隔离；磁盘 IO 挪线程池，不阻塞事件循环）
     chunk_dir = _chunk_dir(user, md5_val)
     merged_path = chunk_dir + "_merged"
-    with open(merged_path, "wb") as out:
-        for i in range(chunk_count):
-            chunk_path = os.path.join(chunk_dir, str(i))
-            with open(chunk_path, "rb") as f:
-                out.write(f.read())
+    await asyncio.to_thread(_merge_chunk_files, chunk_dir, chunk_count, merged_path)
 
-    # 实际 MD5 校验
-    actual_md5 = hashlib.md5(open(merged_path, "rb").read()).hexdigest()
+    # 实际 MD5 校验（流式，1MB 块）
+    actual_md5 = await asyncio.to_thread(_md5_of_file, merged_path)
     if actual_md5 != md5_val:
-        os.remove(merged_path)
+        await asyncio.to_thread(os.remove, merged_path)
         return {"code": 1, "msg": "MD5 校验失败"}
 
     file_size = os.path.getsize(merged_path)
@@ -213,11 +229,11 @@ async def chunk_merge(body: dict):
             existing.count += 1
             url = existing.url
         else:
-            ensure_bucket()
+            await asyncio.to_thread(ensure_bucket)
             # 对象名使用完整 md5（合并前已做内容 MD5 校验），避免前缀碰撞覆盖
             object_name = f"{md5_val}/{filename}"
             with open(merged_path, "rb") as f:
-                client.put_object(BUCKET, object_name, f, file_size)
+                await asyncio.to_thread(client.put_object, BUCKET, object_name, f, file_size)
             url = f"/files/{BUCKET}/{object_name}"
             db.add(FileInfo(
                 md5=md5_val,
@@ -255,12 +271,21 @@ async def chunk_merge(body: dict):
         else:
             db.add(UserFileCount(user=user, count=1))
 
-        await db.commit()
+        try:
+            await db.commit()
+        except IntegrityError:
+            # 并发合并相同内容：另一请求已建 file_info，按"已存在"处理而非 500
+            await db.rollback()
+            import shutil
+            os.remove(merged_path)
+            shutil.rmtree(chunk_dir, ignore_errors=True)
+            await redis.delete(redis_key)
+            return {"code": 5}
 
     # 清理 Redis 和临时文件
     await redis.delete(redis_key)
-    os.remove(merged_path)
+    await asyncio.to_thread(os.remove, merged_path)
     import shutil
-    shutil.rmtree(chunk_dir, ignore_errors=True)
+    await asyncio.to_thread(shutil.rmtree, chunk_dir, ignore_errors=True)
 
     return {"code": 0}

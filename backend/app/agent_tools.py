@@ -11,6 +11,7 @@ Agent 工具集 —— 7 个文件操作工具，供 ReAct Agent Loop 调用
   DESTRUCTIVE: delete_file, share_file（需用户二次确认）
 """
 import re
+import asyncio
 import numpy as np
 from sqlalchemy import select, delete as sql_delete
 from app.database import Session
@@ -78,7 +79,7 @@ async def tool_search_files(username: str, **kwargs) -> dict:
         return {"error": f"embedding failed: {exc}"}
 
     try:
-        results = faiss_search(username, query_vec, max(top_k, 20))
+        results = await asyncio.to_thread(faiss_search, username, query_vec, max(top_k, 20))
     except Exception as exc:
         return {"error": f"faiss search failed: {exc}"}
 
@@ -361,7 +362,7 @@ async def tool_delete_file(username: str, **kwargs) -> dict:
             fi.count -= 1
             if fi.count <= 0:
                 try:
-                    minio_client.remove_object(BUCKET, fi.file_id)
+                    await asyncio.to_thread(minio_client.remove_object, BUCKET, fi.file_id)
                 except Exception:
                     pass
                 await db.delete(fi)

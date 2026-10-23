@@ -13,6 +13,7 @@ engine = create_async_engine(
     f"?charset=utf8mb4",
     pool_size=10,
     max_overflow=20,
+    pool_pre_ping=True,  # 取连接前探活，MySQL 重启后自动丢弃失效连接
 )
 
 Session = async_sessionmaker(engine, expire_on_commit=False)

@@ -11,6 +11,7 @@ rebuild:  从 MySQL 全量重建用户 FAISS 索引
 """
 import io
 import re
+import asyncio
 import zipfile
 import fitz  # PyMuPDF
 import openpyxl
@@ -39,6 +40,8 @@ router = APIRouter(prefix="/api", tags=["ai"])
 
 # 兼容旧 C 项目的分数阈值
 SCORE_THRESHOLD = 0.45
+# 内容提取（文本/docx/pdf/xlsx）的最大下载体积，超过则跳过提取、退化为文件名描述
+_MAX_EXTRACT_BYTES = 16 * 1024 * 1024
 
 
 def _build_public_url(db_url: str) -> str:
@@ -133,10 +136,10 @@ async def ai_describe(body: dict):
             await _upsert_user_ai_desc(db, user, md5_val, ch.text, vec,
                                        ch.index, ch.context_label)
 
-        # FAISS 逐块写入（commit 前，保证一致性）
+        # FAISS 逐块写入（commit 前，保证一致性）；磁盘操作挪线程池避免阻塞事件循环
         try:
             for i, ch in enumerate(chunks):
-                faiss_id = add_vector(user, vecs[i])
+                faiss_id = await asyncio.to_thread(add_vector, user, vecs[i])
                 await db.execute(
                     text(
                         "UPDATE user_file_ai_desc SET faiss_id = :fid "
@@ -234,15 +237,17 @@ async def _download_and_extract(file_url: str, file_type: str) -> str | None:
             resp = await client.get(file_url)
             if resp.status_code != 200:
                 return None
+            if len(resp.content) > _MAX_EXTRACT_BYTES:
+                return None
             data = resp.content
     except Exception:
         return None
 
     if file_type == "docx":
-        return _parse_docx(data)
+        return await asyncio.to_thread(_parse_docx, data)
 
     # 普通文本：直接解码（尝试 utf-8，失败则 latin-1）
-    return _decode_text(data)
+    return await asyncio.to_thread(_decode_text, data)
 
 
 def _parse_docx(data: bytes) -> str | None:
@@ -292,10 +297,12 @@ async def _download_and_extract_pdf(file_url: str, filename: str) -> tuple[str |
             resp = await client.get(file_url)
             if resp.status_code != 200:
                 return None, None
+            if len(resp.content) > _MAX_EXTRACT_BYTES:
+                return None, None
             data = resp.content
     except Exception:
         return None, None
-    return _extract_pdf_text(data, filename)
+    return await asyncio.to_thread(_extract_pdf_text, data, filename)
 
 
 def _extract_pdf_text(data: bytes, filename: str) -> tuple[str, dict]:
@@ -389,10 +396,12 @@ async def _download_and_extract_xlsx(file_url: str, filename: str) -> tuple[str 
             resp = await client.get(file_url)
             if resp.status_code != 200:
                 return None, None
+            if len(resp.content) > _MAX_EXTRACT_BYTES:
+                return None, None
             data = resp.content
     except Exception:
         return None, None
-    return _extract_xlsx_text(data, filename)
+    return await asyncio.to_thread(_extract_xlsx_text, data, filename)
 
 
 def _extract_xlsx_text(data: bytes, filename: str) -> tuple[str, dict]:
@@ -472,7 +481,7 @@ async def _copy_cache_to_user(db, user: str, md5_val: str, caches: list) -> dict
         await _upsert_user_ai_desc(db, user, md5_val, cache.description,
                                    vec, cidx, clabel)
 
-        faiss_id = add_vector(user, vec)
+        faiss_id = await asyncio.to_thread(add_vector, user, vec)
         await db.execute(
             text(
                 "UPDATE user_file_ai_desc SET faiss_id = :fid "
@@ -557,12 +566,12 @@ async def _auto_rebuild_if_dirty(user: str):
         rows = result.scalars().all()
 
         if not rows:
-            rebuild_from_db(user, [])
+            await asyncio.to_thread(rebuild_from_db, user, [])
         else:
             vectors = [np.frombuffer(r.embedding, dtype=np.float32) for r in rows]
-            rebuild_from_db(user, vectors)
+            await asyncio.to_thread(rebuild_from_db, user, vectors)
             # 回写 faiss_id
-            idx = load_index(user)
+            idx = await asyncio.to_thread(load_index, user)
             for i, r in enumerate(rows):
                 if i < idx.ntotal:
                     r.faiss_id = i
@@ -824,7 +833,7 @@ async def ai_search(body: dict):
         except Exception:
             pass  # 重建失败不影响搜索，用现存索引继续
 
-    if get_ntotal(user) == 0:
+    if await asyncio.to_thread(get_ntotal, user) == 0:
         return {"code": 0, "count": 0, "files": []}
 
     # ── 查询预处理：特征检测 → 分类 → 改写 ──
@@ -846,7 +855,7 @@ async def ai_search(body: dict):
             return {"code": 1, "msg": f"embedding failed: {exc}"}
         query_vec = np.array(embedding, dtype=np.float32)
     try:
-        results = faiss_search(user, query_vec, top_k)
+        results = await asyncio.to_thread(faiss_search, user, query_vec, top_k)
     except Exception as exc:
         return {"code": 1, "msg": f"faiss search failed: {exc}"}
 
@@ -964,12 +973,12 @@ async def ai_rebuild(body: dict):
 
         vectors = [np.frombuffer(r.embedding, dtype=np.float32) for r in rows]
         try:
-            rebuild_from_db(user, vectors)
+            await asyncio.to_thread(rebuild_from_db, user, vectors)
         except Exception as exc:
             return {"code": 1, "msg": f"faiss rebuild failed: {exc}"}
 
         # 更新 faiss_id（重建后 id 从 0 重新分配）
-        idx = load_index(user)
+        idx = await asyncio.to_thread(load_index, user)
         for i, r in enumerate(rows):
             if i < idx.ntotal:
                 r.faiss_id = i
