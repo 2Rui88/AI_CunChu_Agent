@@ -54,6 +54,9 @@ class ShareFileList(Base):
     file_name = Column(String(128))
     pv = Column(Integer, default=1)
     create_time = Column(TIMESTAMP, server_default=text("CURRENT_TIMESTAMP"))
+    __table_args__ = (
+        UniqueConstraint("md5", "file_name", name="uq_share_md5_filename"),
+    )
 
 
 class UserFileCount(Base):

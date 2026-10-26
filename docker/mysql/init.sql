@@ -44,6 +44,7 @@ CREATE TABLE IF NOT EXISTS share_file_list (
     file_name VARCHAR(128),
     pv INT DEFAULT 1,
     create_time TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    UNIQUE KEY uq_share_md5_filename (md5, file_name),
     KEY idx_sfl_user (user),
     KEY idx_sfl_md5 (md5(191))
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;

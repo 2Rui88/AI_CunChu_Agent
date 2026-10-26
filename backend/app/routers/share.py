@@ -57,13 +57,8 @@ async def _share_file(user: str, md5_val: str, filename: str) -> dict:
     """分享文件 —— 标记为已分享 + 写入共享列表 + 更新 Redis"""
     fileid = f"{md5_val}{filename}"
 
-    # 先查 Redis ZSET 是否已有该文件（防止重复分享）
-    score = await redis.zscore(FILE_PUBLIC_ZSET, fileid)
-    if score is not None:
-        return {"code": 3}  # 别人已经分享
-
     async with Session() as db:
-        # MySQL 中再确认一次
+        # 数据库是真值来源；Redis 可能丢失，不能用于唯一性判断
         result = await db.execute(
             select(UserFileList).where(
                 UserFileList.user == user,
@@ -74,6 +69,17 @@ async def _share_file(user: str, md5_val: str, filename: str) -> dict:
         ufl = result.scalar()
         if ufl is None:
             return {"code": 1}
+        if ufl.shared_status == 1:
+            return {"code": 3}
+
+        result = await db.execute(
+            select(ShareFileList).where(
+                ShareFileList.md5 == md5_val,
+                ShareFileList.file_name == filename,
+            ).limit(1)
+        )
+        if result.scalar() is not None:
+            return {"code": 3}
 
         # 标记为已分享
         ufl.shared_status = 1
@@ -91,7 +97,11 @@ async def _share_file(user: str, md5_val: str, filename: str) -> dict:
         else:
             db.add(UserFileCount(user=FILE_PUBLIC_COUNT, count=1))
 
-        await db.commit()
+        try:
+            await db.commit()
+        except IntegrityError:
+            await db.rollback()
+            return {"code": 3}
 
     # 更新 Redis：ZSET 添加成员 + HASH 存文件名映射
     await redis.zadd(FILE_PUBLIC_ZSET, {fileid: 0})
@@ -124,13 +134,16 @@ async def _del_file(user: str, md5_val: str, filename: str) -> dict:
 
         # 如果已分享，清理分享相关数据
         if shared == 1:
-            await db.execute(
+            delete_result = await db.execute(
                 delete(ShareFileList).where(
                     ShareFileList.user == user,
                     ShareFileList.md5 == md5_val,
                     ShareFileList.file_name == filename,
                 )
             )
+            if delete_result.rowcount != 1:
+                await db.rollback()
+                return {"code": 1}
             # 公共计数 -1
             result = await db.execute(
                 select(UserFileCount).where(UserFileCount.user == FILE_PUBLIC_COUNT)
@@ -161,7 +174,9 @@ async def _del_file(user: str, md5_val: str, filename: str) -> dict:
             ufc.count -= 1
 
         # file_info 引用计数 -1
-        result = await db.execute(select(FileInfo).where(FileInfo.md5 == md5_val))
+        result = await db.execute(
+            select(FileInfo).where(FileInfo.md5 == md5_val).with_for_update()
+        )
         fi = result.scalar()
         if fi:
             fi.count -= 1
@@ -366,10 +381,13 @@ async def _save_shared(user: str, md5_val: str, filename: str) -> dict:
             return {"code": 5}
 
         # file_info 引用计数 +1
-        result = await db.execute(select(FileInfo).where(FileInfo.md5 == md5_val))
+        result = await db.execute(
+            select(FileInfo).where(FileInfo.md5 == md5_val).with_for_update()
+        )
         fi = result.scalar()
-        if fi:
-            fi.count += 1
+        if fi is None:
+            return {"code": 1, "msg": "file not found"}
+        fi.count += 1
 
         db.add(UserFileList(user=user, md5=md5_val, file_name=filename))
 
@@ -397,14 +415,28 @@ async def _cancel_share(user: str, md5_val: str, filename: str) -> dict:
     fileid = f"{md5_val}{filename}"
 
     async with Session() as db:
+        owned = await db.execute(
+            select(UserFileList).where(
+                UserFileList.user == user,
+                UserFileList.md5 == md5_val,
+                UserFileList.file_name == filename,
+                UserFileList.shared_status == 1,
+            ).limit(1)
+        )
+        if owned.scalar() is None:
+            return {"code": 1}
+
         # 删除共享记录
-        await db.execute(
+        delete_result = await db.execute(
             delete(ShareFileList).where(
                 ShareFileList.user == user,
                 ShareFileList.md5 == md5_val,
                 ShareFileList.file_name == filename,
             )
         )
+        if delete_result.rowcount != 1:
+            await db.rollback()
+            return {"code": 1}
 
         # 恢复用户文件 shared_status
         await db.execute(
