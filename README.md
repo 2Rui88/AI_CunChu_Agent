@@ -10,11 +10,10 @@
 
 | 功能 | 说明 |
 |------|------|
-| **文件管理** | 上传、秒传、分片上传、文件夹、分享、删除，标准云盘功能 |
+| **文件管理** | 上传、秒传、分片上传、分享、删除，标准云盘功能 |
 | **AI 语义搜索** | 上传的文档自动提取内容 → 智能分块 → 向量化，支持自然语言搜索 |
 | **多格式解析** | 支持 PDF、Word、Excel、Markdown、代码等 7 种文件格式的内容提取 |
 | **AI 文件助手** | 对话式交互，可以搜索文件、查看详情、分享、删除，危险操作需确认 |
-| **图床分享** | 图片生成 8 位提取码，方便外部分享 |
 
 ### 一个典型的使用流程
 
@@ -43,23 +42,22 @@
 | 缓存 | Redis 7 |
 | Web 服务器 | Nginx 1.26 (SSL 终端 + 反向代理) |
 | 容器化 | Docker Compose |
-| 文档解析 | PyMuPDF (PDF) + openpyxl (Excel) + python-docx |
+| 文档解析 | PyMuPDF (PDF) + openpyxl (Excel)，docx 经 ZIP+XML 直接提取 |
 
 ## 功能说明
 
 ### 文件管理
 
-- **上传与秒传**：上传前先计算文件 MD5 发送给服务端，若目标文件已存在则直接引用，无需重复传输
-- **分片上传**：大文件自动拆分为分片，支持断点续传——网络中断后重传只需补传缺失分片
-- **文件列表**：按上传时间降序展示，支持分页
-- **文件下载**：MinIO 直链下载，不经过后端，不占用 Python 进程资源
-- **删除保护**：同一文件被多个用户引用时，仅删除自己的引用，物理文件在最后一个引用者删除时清理
+- **上传与秒传**：上传前先计算文件 MD5 发送给服务端，若目标文件已存在则直接引用，无需重复传输；服务端会复核内容 MD5，防止伪造
+- **分片上传**：大文件自动拆分为分片，支持断点续传——网络中断后重传只需补传缺失分片（分片临时目录挂 Docker 卷，容器重启也不丢）
+- **文件列表**：按上传时间降序展示，支持分页；未建立内容索引的文件（超体积门槛或提取失败）可手动重建索引
+- **文件下载**：限时预签名 URL 直连 MinIO（默认 2 小时有效），不经过后端进程；桶为私有，链接过期即失效
+- **删除保护**：同一文件被多个用户引用时，仅删除自己的引用，物理文件在最后一个引用者删除时清理（引用计数带行级锁，防并发丢失更新）
 
-### 分享与图床
+### 分享与排行
 
-- **共享广场**：文件分享后出现在共享广场，其他用户可转存到自己的存储空间
-- **下载排行**：Redis ZSET 记录下载量，支持排行榜展示
-- **图床模式**：图片生成 8 位随机提取码，方便在论坛、文档中引用
+- **共享广场**：文件分享后出现在共享广场，其他登录用户可转存到自己的存储空间（仅限确已共享的文件）
+- **下载排行**：MySQL 为真值来源，Redis ZSET 作排行榜缓存，缓存丢失自动懒重建
 - **取消分享**：分享者可以随时撤销，同时清理 Redis 和共享列表
 
 ### AI 文件理解
@@ -107,8 +105,7 @@
 ### 维护与一致性
 
 - **脏标记自动重建**：文件删除后标记 dirty，下次搜索前自动从 MySQL 全量重建 FAISS 索引
-- **文件锁并发控制**：防止多个搜索请求同时触发重建
-- **定期巡检函数**：对比 MySQL 记录数与 FAISS ntotal 的一致性
+- **文件锁并发控制**：防止多个搜索请求同时触发重建；add_vector/rebuild 均持用户级文件锁（跨 worker 串行化），索引落盘为原子替换
 
 ## 快速开始
 
@@ -122,21 +119,22 @@
 
 ```bash
 # 1. 克隆项目
-git clone <repo-url> && cd AI_YunCunChu-main
+git clone <repo-url> && cd AI_CunChu_Agent
 
-# 2. 构建前端
-cd frontend && npm install && npm run build && cd ..
+# 2. 配置环境变量
+cp docker/.env.example docker/.env
+#    编辑 docker/.env：
+#    - 修改 MySQL/MinIO 密码（必填）
+#    - PUBLIC_SERVER_IP 设为服务器 IP/域名（生成预签名下载链接必需）
 
-# 3. 配置环境变量
-cp docker/.env.example docker/.env  # 编辑修改密码
-
-# 4. 启动所有服务
+# 3. 启动所有服务（前端已内置到 Nginx 镜像的多阶段构建中，无需单独构建）
 cd docker && docker compose up -d --build
 
-# 5. 将前端构建产物推入 Nginx 容器
-docker cp ../frontend/build/. tc_nginx:/app/front/
+# 4. 存量数据库执行迁移（新数据卷跳过）
+docker exec -i tc_mysql mysql -uroot -p"$MYSQL_ROOT_PASSWORD" yuncunchu < mysql/migration_bcrypt.sql
+docker exec -i tc_mysql mysql -uroot -p"$MYSQL_ROOT_PASSWORD" yuncunchu < mysql/migration_share_unique.sql
 
-# 6. 访问
+# 5. 访问
 open https://localhost
 ```
 
@@ -165,32 +163,29 @@ AI_YunCunChu-main/
 │   │   ├── chunker.py              # 7 类文件自适应分块器
 │   │   ├── agent_tools.py          # Agent 7 个工具函数
 │   │   └── routers/
-│   │       ├── auth.py             # 注册/登录（加盐 MD5）
+│   │       ├── auth.py             # 注册/登录（bcrypt + 限流）
 │   │       ├── files.py            # 上传/秒传/文件列表
 │   │       ├── chunk.py            # 大文件分片上传
-│   │       ├── share.py            # 分享/删除/图床
+│   │       ├── share.py            # 分享/删除/转存/排行
 │   │       ├── ai.py               # AI 搜索/描述/重建（含分块+Rerank）
-│   │       └── agent.py            # Agent SSE 对话 + 确认门控
+│   │       └── agent.py            # Agent SSE 对话 + 确认门控（Redis）
 │   ├── gunicorn.conf.py            # 生产配置
 │   ├── Dockerfile
 │   └── requirements.txt
 ├── frontend/                       # React 前端
 │   └── src/
-│       ├── components/             # NavBar / ChatPanel / ConfirmModal
-│       ├── pages/                  # Login / Home / FileList / ImageList ...
+│       ├── components/             # AppSidebar / PageHeader / ChatPanel / ConfirmModal
+│       ├── pages/                  # Login / Home / FileList / ImageList / SharedFiles / TopDownloads
 │       ├── services/               # auth.js / images.js / ai.js / agent.js
 │       └── config/index.js         # API 端点配置
 ├── docker/
-│   ├── docker-compose.yaml         # 5 容器编排
-│   ├── .env                        # 密码配置（不入 Git）
+│   ├── docker-compose.yaml         # 5 容器编排（前端经多阶段构建内置入 Nginx 镜像）
+│   ├── .env                        # 密码/公网地址配置（不入 Git）
 │   ├── nginx/                      # Nginx 配置 + Let's Encrypt + SSL
 │   └── mysql/                      # 建表 SQL + 迁移脚本
-├── PROJECT_GUIDE.md                # 项目架构分析
-├── RAG_AGENT_DESIGN.md             # Agent 方案设计
 ├── RAG_UPGRADE_DESIGN.md           # RAG 检索升级设计
-├── IMPLEMENTATION_ROADMAP.md       # 实现思路
-├── IMPLEMENTATION_GUIDE.md         # 落地指南
-├── DEPLOY_FEASIBILITY.md           # 部署可行性分析
+├── RAG_UPGRADE_PROGRESS.md         # RAG 升级进度跟踪
+├── IMPLEMENTATION_STRATEGY.md      # 实现思路
 └── PROGRESS.md                     # 实现进度跟踪
 ```
 
@@ -222,7 +217,6 @@ tc_nginx   :443/80   Nginx 反向代理
 | `/api/dealfile?cmd=share\|del\|pv` | POST | 分享/删除/下载计数 |
 | `/api/sharefiles?cmd=normal\|pvdesc` | POST | 共享广场/下载排行 |
 | `/api/dealsharefile?cmd=save\|cancel\|pv` | POST | 转存/取消分享 |
-| `/api/sharepic` | POST | 图床分享 (8 位提取码) |
 | `/api/chunk_init` | POST | 分片上传初始化 |
 | `/api/chunk_upload` | POST | 分片上传 |
 | `/api/chunk_merge` | POST | 分片合并 |
@@ -244,13 +238,16 @@ tc_nginx   :443/80   Nginx 反向代理
 | `embedding_dimension` | 768 | 向量维度 |
 | `embedding_max_chars` | 3000 | 单切片最大字符数（分块阈值） |
 | `pdf_max_extract_chars` | 8000 | PDF 单次提取最大字符数 |
-| `public_server_ip` | (空) | 公网 IP（图片描述需要 DashScope 能访问） |
+| `public_server_ip` | (空) | 公网 IP/域名（预签名下载链接与 DashScope 拉图必需） |
+| `public_server_ssl` | true | 对外地址是否为 HTTPS |
+| `parse_max_mb` | 100 | 常规内容提取的文件体积安全线（MB），超过退化为文件名存根 |
 | `conversation_ttl_seconds` | 3600 | 对话记忆过期时间 |
 
 ## 部署上线
 
 1. 购买云服务器（建议 4 核 8 GB）
 2. 安装 Docker Desktop
-3. 将 `public_server_ip` 设为服务器公网 IP
+3. `docker/.env` 中将 `PUBLIC_SERVER_IP` 设为服务器公网 IP/域名
 4. 执行 `docker/nginx/setup-certbot.sh 你的域名` 获取 SSL 证书
 5. `docker compose up -d --build`
+6. 存量数据库按顺序执行 `docker/mysql/` 下的迁移脚本

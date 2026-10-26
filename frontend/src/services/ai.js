@@ -88,23 +88,3 @@ export const aiSearch = async (query, user, apiKey) => {
   }
   return data;
 };
-
-/**
- * 重建 FAISS 索引
- */
-export const rebuildIndex = async (user) => {
-  const response = await fetch(`${AI_ENDPOINT}/rebuild`, {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({
-      user: user.username,
-      token: user.token
-    })
-  });
-
-  const data = await response.json();
-  if (data.code !== 0) {
-    throw new Error(data.msg || '重建索引失败');
-  }
-  return data;
-};

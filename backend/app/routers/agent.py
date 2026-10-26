@@ -10,7 +10,7 @@ import json
 import uuid
 import asyncio
 import time
-from fastapi import APIRouter, Request
+from fastapi import APIRouter
 from sse_starlette.sse import EventSourceResponse
 from pydantic import BaseModel
 from openai import AsyncOpenAI
