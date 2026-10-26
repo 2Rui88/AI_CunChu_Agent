@@ -37,20 +37,23 @@ services:
         ipv4_address: 172.30.0.3
 
   minio:
-    image: minio/minio:latest
+    # MinIO 社区版 2025 年停止自由分发（Docker Hub 仓库门禁、dl.min.io 下线），
+    # 改用 Bitnami 遗留仓库镜像 —— 同一 MinIO 服务器二进制的封装。
+    # 数据目录为 /bitnami/minio/data（非官方镜像的 /data），入口脚本自管启动参数。
+    image: bitnamilegacy/minio:latest
     container_name: tc_minio
     restart: unless-stopped
-    command: server /data --console-address ":9001"
     ports:
-      # 控制台仅绑定本机回环，不再暴露公网（桶已私有化，管理面不需要对外）
+      # 控制台仅绑定本机回环，不对公网暴露（桶已私有化，管理面不需要对外）
       - "127.0.0.1:9001:9001"
     volumes:
-      - minio_data:/data
+      - minio_data:/bitnami/minio/data
     environment:
       MINIO_ROOT_USER: ${MINIO_ROOT_USER}
       MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD}
     healthcheck:
-      test: ["CMD", "curl", "-f", "http://localhost:9000/minio/health/live"]
+      # Bitnami 精简镜像不带 curl，用 bash 内置 TCP 探测 9000 端口
+      test: ["CMD-SHELL", "bash -c 'exec 3<>/dev/tcp/127.0.0.1/9000' || exit 1"]
       interval: 10s
       timeout: 5s
       retries: 5
