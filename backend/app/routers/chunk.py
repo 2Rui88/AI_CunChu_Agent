@@ -224,7 +224,9 @@ async def chunk_merge(body: dict):
     async with Session() as db:
         # MD5 去重：检查是否已有相同文件
         from sqlalchemy import select as _select
-        result = await db.execute(_select(FileInfo).where(FileInfo.md5 == md5_val))
+        result = await db.execute(
+            _select(FileInfo).where(FileInfo.md5 == md5_val).with_for_update()
+        )
         existing = result.scalar()
 
         if existing:

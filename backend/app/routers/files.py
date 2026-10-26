@@ -40,7 +40,9 @@ async def md5_check(body: dict):
         if result.scalar():
             return {"code": 5}
 
-        result = await db.execute(select(FileInfo).where(FileInfo.md5 == md5))
+        result = await db.execute(
+            select(FileInfo).where(FileInfo.md5 == md5).with_for_update()
+        )
         existing = result.scalar()
         if existing:
             existing.count += 1
@@ -89,7 +91,9 @@ async def upload(
     md5 = actual_md5
 
     async with Session() as db:
-        result = await db.execute(select(FileInfo).where(FileInfo.md5 == md5))
+        result = await db.execute(
+            select(FileInfo).where(FileInfo.md5 == md5).with_for_update()
+        )
         existing = result.scalar()
 
         if existing:

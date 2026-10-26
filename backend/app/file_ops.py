@@ -12,7 +12,9 @@ async def attach_file_to_user(user: str, md5: str, filename: str) -> bool:
     返回 True 表示关联已落库；False 表示用户已拥有或 file_info 不存在（按已存在处理）。
     """
     async with Session() as db:
-        result = await db.execute(select(FileInfo).where(FileInfo.md5 == md5))
+        result = await db.execute(
+            select(FileInfo).where(FileInfo.md5 == md5).with_for_update()
+        )
         fi = result.scalar()
         if fi is None:
             await db.rollback()

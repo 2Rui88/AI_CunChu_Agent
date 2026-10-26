@@ -371,7 +371,11 @@ async def tool_delete_file(username: str, **kwargs) -> dict:
             if ufc and ufc.count > 0:
                 ufc.count -= 1
 
-            # 引用计数处理
+            # 引用计数处理：锁定 file_info，避免并发删除丢失减量
+            locked = await db.execute(
+                select(FileInfo).where(FileInfo.md5 == ufl.md5).with_for_update()
+            )
+            fi = locked.scalar_one_or_none()
             fi.count -= 1
             if fi.count <= 0:
                 try:
