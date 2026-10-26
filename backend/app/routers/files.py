@@ -5,7 +5,7 @@ from fastapi import APIRouter, UploadFile, File, Form
 from sqlalchemy import select
 from sqlalchemy.exc import IntegrityError
 from app.database import Session
-from app.models import FileInfo, UserFileList, UserFileCount
+from app.models import FileInfo, UserFileList, UserFileCount, UserFileAiDesc
 from app.dependencies import check_token
 from app.file_ops import attach_file_to_user
 from app.minio_client import client, BUCKET, ensure_bucket, presign_from_db_url
@@ -184,6 +184,28 @@ async def myfiles(body: dict):
             .limit(count)
         )
         rows = result.all()
+
+        # 已建立内容索引的 md5 集合（排除"未索引内容"存根），供前端显示重建入口
+        indexed: set = set()
+        if rows:
+            result = await db.execute(
+                select(UserFileAiDesc.md5).where(
+                    UserFileAiDesc.user == user,
+                    UserFileAiDesc.status == 1,
+                    UserFileAiDesc.md5.in_([ufl.md5 for ufl, _ in rows]),
+                ).distinct()
+            )
+            desc_md5s = {r[0] for r in result.all()}
+            if desc_md5s:
+                stub = await db.execute(
+                    select(UserFileAiDesc.md5).where(
+                        UserFileAiDesc.user == user,
+                        UserFileAiDesc.md5.in_(desc_md5s),
+                        UserFileAiDesc.context_label == "未索引内容",
+                    ).distinct()
+                )
+                indexed = desc_md5s - {r[0] for r in stub.all()}
+
         files = []
         for ufl, fi in rows:
             files.append({
@@ -194,6 +216,7 @@ async def myfiles(body: dict):
                 "type": fi.type,
                 "pv": ufl.pv,
                 "shared_status": ufl.shared_status,
+                "content_indexed": ufl.md5 in indexed,
                 "create_time": str(ufl.create_time),
             })
         return {"code": 0, "files": files}

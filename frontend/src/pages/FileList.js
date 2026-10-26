@@ -147,16 +147,26 @@ const FileList = () => {
     document.body.removeChild(link);
   };
 
-  // 大文件（超内容索引门槛）手动建立内容索引：后端以 force 重新提取，硬上限放宽
+  // 手动建立内容索引：大文件（超门槛）或提取失败的存根文件均可用；后端以 force 重新提取，硬上限放宽
+  const needIndex = (record) => record.content_indexed === false;
+  const indexTooltip = (record) => (
+    Number(record.size) > API_CONFIG.CONTENT_INDEX_LIMIT
+      ? '建立内容索引（该文件较大，尚未索引内容）'
+      : '重新建立内容索引（上次内容提取未成功）'
+  );
+
   const handleBuildIndex = (record) => {
     const apiKey = localStorage.getItem('dashscope_api_key_' + user.username) || '';
     if (!apiKey) {
       message.warning('请先在首页设置 DashScope API Key');
       return;
     }
+    const isBig = Number(record.size) > API_CONFIG.CONTENT_INDEX_LIMIT;
     Modal.confirm({
       title: '建立内容索引',
-      content: `「${record.file_name}」体积较大，提取内容可能需要一些时间，确定继续？`,
+      content: isBig
+        ? `「${record.file_name}」体积较大，提取内容可能需要一些时间，确定继续？`
+        : `重新为「${record.file_name}」提取内容并建立索引，确定继续？`,
       okText: '开始建立',
       cancelText: '取消',
       onOk: async () => {
@@ -245,8 +255,8 @@ const FileList = () => {
           <Tooltip title="下载">
             <Button type="text" icon={<DownloadOutlined />} onClick={() => handleDownload(record)} />
           </Tooltip>
-          {Number(record.size) > API_CONFIG.CONTENT_INDEX_LIMIT && (
-            <Tooltip title="建立内容索引（该文件较大，尚未索引内容）">
+          {needIndex(record) && (
+            <Tooltip title={indexTooltip(record)}>
               <Button type="text" icon={<FileSearchOutlined style={{ color: '#d97706' }} />} onClick={() => handleBuildIndex(record)} />
             </Tooltip>
           )}
