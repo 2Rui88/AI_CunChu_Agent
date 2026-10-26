@@ -15,6 +15,8 @@ client = Minio(
     access_key=settings.minio_access_key,
     secret_key=settings.minio_secret_key,
     secure=False,
+    # 固定 region 后 SDK 不再发起 GetBucketLocation 网络请求（MinIO 默认 us-east-1）
+    region="us-east-1",
 )
 
 BUCKET = settings.minio_bucket
@@ -44,6 +46,10 @@ def _sign_client() -> Minio:
         access_key=settings.minio_access_key,
         secret_key=settings.minio_secret_key,
         secure=secure,
+        # 关键：固定 region 使预签名为纯本地计算。
+        # 否则 SDK 会向该对外端点发起 GetBucketLocation 请求，
+        # 而对外地址（如 localhost:443）在后端容器内不可达。
+        region="us-east-1",
     )
     return _sign_client_instance
 
@@ -71,7 +77,7 @@ def presign_url(object_name: str, expires: int = 7200) -> str:
     以命中 nginx 的 /files/ 代理（该代理保留原始 Host，通过 SigV4 校验）。
     """
     raw = _sign_client().presigned_get_object(
-        BUCKET, object_name, expiry=timedelta(seconds=expires)
+        BUCKET, object_name, expires=timedelta(seconds=expires)
     )
     marker = f"/{BUCKET}/"
     pos = raw.find(marker)
@@ -83,7 +89,7 @@ def presign_url(object_name: str, expires: int = 7200) -> str:
 def presign_internal_url(object_name: str, expires: int = 600) -> str:
     """后端内网下载用签名 URL（内网直连 MinIO，适配私有桶）"""
     return client.presigned_get_object(
-        BUCKET, object_name, expiry=timedelta(seconds=expires)
+        BUCKET, object_name, expires=timedelta(seconds=expires)
     )
 
 
