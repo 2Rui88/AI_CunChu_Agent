@@ -8,3 +8,6 @@ JOIN share_file_list s2
 
 ALTER TABLE share_file_list
     ADD UNIQUE KEY uq_share_md5_filename (md5, file_name);
+
+-- 分享计数起点与 Redis 对齐为 0（原 DEFAULT 1 会使重建后的排行榜多 1）
+ALTER TABLE share_file_list MODIFY COLUMN pv INT DEFAULT 0;

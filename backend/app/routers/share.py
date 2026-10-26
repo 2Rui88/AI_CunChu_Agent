@@ -85,7 +85,7 @@ async def _share_file(user: str, md5_val: str, filename: str) -> dict:
         ufl.shared_status = 1
 
         # 插入共享文件列表
-        db.add(ShareFileList(user=user, md5=md5_val, file_name=filename))
+        db.add(ShareFileList(user=user, md5=md5_val, file_name=filename, pv=0))
 
         # 更新公共文件计数
         result = await db.execute(

@@ -438,7 +438,7 @@ async def tool_share_file(username: str, **kwargs) -> dict:
                 return {"success": False, "message": f"文件 '{ufl.file_name}' 已被分享"}
 
             ufl.shared_status = 1
-            db.add(ShareFileList(user=username, md5=ufl.md5, file_name=ufl.file_name))
+            db.add(ShareFileList(user=username, md5=ufl.md5, file_name=ufl.file_name, pv=0))
 
             # 公共计数 +1
             result = await db.execute(

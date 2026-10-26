@@ -42,7 +42,7 @@ CREATE TABLE IF NOT EXISTS share_file_list (
     user VARCHAR(32) NOT NULL,
     md5 VARCHAR(256) NOT NULL,
     file_name VARCHAR(128),
-    pv INT DEFAULT 1,
+    pv INT DEFAULT 0,
     create_time TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
     UNIQUE KEY uq_share_md5_filename (md5, file_name),
     KEY idx_sfl_user (user),
