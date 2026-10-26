@@ -376,13 +376,15 @@ async def tool_delete_file(username: str, **kwargs) -> dict:
                 select(FileInfo).where(FileInfo.md5 == ufl.md5).with_for_update()
             )
             fi = locked.scalar_one_or_none()
-            fi.count -= 1
-            if fi.count <= 0:
-                try:
-                    await asyncio.to_thread(minio_client.remove_object, BUCKET, fi.file_id)
-                except Exception:
-                    pass
-                await db.delete(fi)
+            if fi is not None:
+                fi.count -= 1
+                if fi.count <= 0:
+                    try:
+                        await asyncio.to_thread(minio_client.remove_object, BUCKET, fi.file_id)
+                    except Exception:
+                        pass
+                    await db.delete(fi)
+            # file_info 已被并发删除（引用恰好归零）时无需引用处理，继续删除用户关联
 
             await db.commit()
     except Exception as exc:
