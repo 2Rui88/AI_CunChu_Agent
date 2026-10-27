@@ -3,6 +3,9 @@ uvicorn[standard]==0.30.0
 gunicorn==23.0.0
 sqlalchemy[asyncio]==2.0.55
 aiomysql==0.2.0
+# aiomysql 0.2.0 与 pymysql 2.x 不兼容（2.x 废除了 escape_bytes_prefixed 导致
+# 二进制参数崩溃），钉住 1.x 直至 aiomysql 有新版本
+pymysql==1.1.1
 redis==5.0.0
 pydantic==2.9.0
 pydantic-settings==2.5.0
