@@ -4,7 +4,9 @@ services:
     container_name: tc_mysql
     restart: unless-stopped
     # 服务端默认字符集设为 utf8mb4，保证中文文件名/描述正常存储
-    command: --character-set-server=utf8mb4 --collation-server=utf8mb4_unicode_ci
+    # 默认时区设为 +08:00：TIMESTAMP 列内部按 UTC 存储、读取按会话时区转换，
+    # 不设置时容器为 UTC，共享广场/文件列表的时间会比北京时间早 8 小时
+    command: --character-set-server=utf8mb4 --collation-server=utf8mb4_unicode_ci --default-time-zone=+08:00
     ports:
       # 仅绑定本机回环供调试，不对公网暴露 root 端口
       - "127.0.0.1:3307:3306"
