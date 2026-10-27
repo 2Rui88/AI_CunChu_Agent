@@ -113,6 +113,19 @@ async def tool_get_file_info(username: str, **kwargs) -> dict:
                 return {"found": False, "message": f"未找到文件 '{identifier}'"}
 
             ufl, fi = row
+            # 下载量只统计共享广场的下载，取 share_file_list.pv
+            pv = 0
+            if ufl.shared_status == 1:
+                share_result = await db.execute(
+                    select(ShareFileList.pv).where(
+                        ShareFileList.user == username,
+                        ShareFileList.md5 == ufl.md5,
+                        ShareFileList.file_name == ufl.file_name,
+                    ).limit(1)
+                )
+                share_row = share_result.first()
+                if share_row:
+                    pv = share_row[0] or 0
             return {
                 "found": True,
                 "md5": ufl.md5,
@@ -120,7 +133,7 @@ async def tool_get_file_info(username: str, **kwargs) -> dict:
                 "size": fi.size,
                 "type": fi.type,
                 "url": presign_from_db_url(fi.url) if fi.url else "",
-                "pv": ufl.pv,
+                "pv": pv,
                 "shared": ufl.shared_status == 1,
                 "create_time": str(ufl.create_time),
             }
@@ -175,15 +188,11 @@ async def tool_get_storage_stats(username: str, **kwargs) -> dict:
             )
             shared = shared_count.scalars().all()
 
-            total_downloads = await db.execute(
-                select(UserFileList.pv).where(UserFileList.user == username)
-            )
-            pv_sum = sum(r[0] or 0 for r in total_downloads.all())
-
+            # 下载量只统计共享广场的下载，取该用户已分享文件的累计下载量
             return {
                 "file_count": total_files,
                 "shared_count": len(shared),
-                "total_downloads": pv_sum,
+                "total_downloads": sum(s.pv or 0 for s in shared),
             }
     except Exception as exc:
         return {"error": f"database query failed: {exc}"}

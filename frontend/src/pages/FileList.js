@@ -9,7 +9,7 @@ import {
 import styled from '@emotion/styled';
 import { API_CONFIG } from '../config';
 import { useAuth } from '../contexts/AuthContext';
-import { fetchUserImages, uploadImage, deleteImage, shareFile, cancelShareFile, pvFile } from '../services/images';
+import { fetchUserImages, uploadImage, deleteImage, shareFile, cancelShareFile } from '../services/images';
 import { describeFileByMd5 } from '../services/ai';
 import { IMAGE_EXTS, formatFileSize, getFileIcon } from '../utils/format';
 
@@ -136,8 +136,7 @@ const FileList = () => {
     }
   };
 
-  const handleDownload = async (record) => {
-    pvFile(record, user).catch(() => {});
+  const handleDownload = (record) => {
     const link = document.createElement('a');
     link.href = record.url;
     link.download = record.name;
@@ -230,7 +229,6 @@ const FileList = () => {
       key: 'create_time',
       width: 170,
     },
-    { title: '下载', dataIndex: 'pv', key: 'pv', width: 80 },
     {
       title: '操作',
       key: 'action',

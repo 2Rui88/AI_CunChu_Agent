@@ -3,7 +3,7 @@ import { Card, Table, Button, Tooltip, Space, message, Avatar, Input, Empty } fr
 import { SaveOutlined, DownloadOutlined, ReloadOutlined, SearchOutlined } from '@ant-design/icons';
 import styled from '@emotion/styled';
 import { useAuth } from '../contexts/AuthContext';
-import { fetchSharedFiles, saveSharedFile } from '../services/images';
+import { fetchSharedFiles, saveSharedFile, pvSharedFile } from '../services/images';
 import { getFileIcon, formatFileSize } from '../utils/format';
 
 const WrapCard = styled(Card)`
@@ -78,6 +78,26 @@ export default function SharedFiles() {
     }
   };
 
+  // 下载次数仅在共享广场下载时统计：上报计数成功后本地同步 +1，再打开文件
+  const handleDownload = async (record) => {
+    try {
+      await pvSharedFile(record, user);
+      setFiles((prev) => prev.map((f) => (
+        f.md5 === record.md5 && f.file_name === record.file_name
+          ? { ...f, pv: (f.pv || 0) + 1 }
+          : f
+      )));
+    } catch (error) {
+      if (error.tokenExpired) {
+        message.error('登录已过期，请重新登录');
+        logout();
+        return;
+      }
+      // 计数失败不阻断下载
+    }
+    if (record.url) window.open(record.url, '_blank', 'noopener');
+  };
+
   const filtered = useMemo(
     () => files.filter((f) => (f.file_name || '').toLowerCase().includes(filter.trim().toLowerCase())),
     [files, filter],
@@ -126,7 +146,7 @@ export default function SharedFiles() {
       render: (_, record) => (
         <Space>
           <Tooltip title="下载">
-            <Button type="text" icon={<DownloadOutlined />} href={record.url} target="_blank" />
+            <Button type="text" icon={<DownloadOutlined />} onClick={() => handleDownload(record)} />
           </Tooltip>
           <Tooltip title="转存到我的文件">
             <Button

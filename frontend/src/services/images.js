@@ -163,7 +163,7 @@ export const uploadImage = async (file, user, onProgress) => {
   return { md5 };
 };
 
-/** dealfile 通用调用（share / del / pv） */
+/** dealfile 通用调用（share / del） */
 const dealFile = (cmd, file, user) =>
   post(`${BASE}${E.DEAL_FILE}?cmd=${cmd}`, {
     user: user.username,
@@ -183,8 +183,6 @@ export const shareFile = async (file, user) => {
   if (data.code !== 0) throw new Error(data.msg || '分享失败');
 };
 
-export const pvFile = (file, user) => dealFile('pv', file, user);
-
 export const cancelShareFile = async (file, user) => {
   const data = await post(`${BASE}${E.DEAL_SHARE_FILE}?cmd=cancel`, {
     user: user.username,
@@ -193,6 +191,18 @@ export const cancelShareFile = async (file, user) => {
     filename: file.file_name || file.name,
   });
   if (data.code !== 0) throw new Error(data.msg || '取消分享失败');
+};
+
+/** 共享广场下载计数 —— 下载次数仅在共享广场下载时统计（计入下载排行榜） */
+export const pvSharedFile = async (file, user) => {
+  const data = await post(`${BASE}${E.DEAL_SHARE_FILE}?cmd=pv`, {
+    user: user.username,
+    token: user.token,
+    md5: file.md5,
+    filename: file.file_name,
+  });
+  if (data.code !== 0) throw new Error(data.msg || '下载计数失败');
+  return data;
 };
 
 /** 共享广场列表 */

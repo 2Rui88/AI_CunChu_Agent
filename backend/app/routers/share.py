@@ -28,12 +28,12 @@ FILE_PUBLIC_COUNT = "FILE_PUBLIC_COUNT"
 
 
 # ============================================================
-#  dealfile —— 分享 / 删除 / 下载计数（PV）
+#  dealfile —— 分享 / 删除
 # ============================================================
 
 @router.post("/dealfile")
 async def dealfile(request: Request, body: dict):
-    """文件操作入口：cmd=share 分享, cmd=del 删除, cmd=pv 下载计数"""
+    """文件操作入口：cmd=share 分享, cmd=del 删除"""
     user = body.get("user", "")
     token = body.get("token", "")
     if not await check_token(user, token):
@@ -48,8 +48,6 @@ async def dealfile(request: Request, body: dict):
         return await _share_file(user, md5_val, filename)
     elif cmd == "del":
         return await _del_file(user, md5_val, filename)
-    elif cmd == "pv":
-        return await _pv_file(user, md5_val, filename)
     return {"code": 1}
 
 
@@ -192,45 +190,6 @@ async def _del_file(user: str, md5_val: str, filename: str) -> dict:
 
     # 标记 FAISS 需要重建（下次搜索自动触发）
     mark_dirty(user)
-
-    return {"code": 0}
-
-
-async def _pv_file(user: str, md5_val: str, filename: str) -> dict:
-    """更新下载计数 —— user_file_list.pv +1, share_file_list.pv +1, Redis ZSET score +1"""
-    async with Session() as db:
-        # user_file_list 中 pv +1
-        result = await db.execute(
-            select(UserFileList).where(
-                UserFileList.user == user,
-                UserFileList.md5 == md5_val,
-                UserFileList.file_name == filename,
-            )
-        )
-        ufl = result.scalar()
-        if ufl is None:
-            return {"code": 1}
-
-        ufl.pv = (ufl.pv or 0) + 1
-        shared = ufl.shared_status
-
-        # 如果已分享，同步更新 share_file_list（自增 +1，而非覆盖为文件主累计值）
-        if shared == 1:
-            await db.execute(
-                update(ShareFileList)
-                .where(
-                    ShareFileList.user == user,
-                    ShareFileList.md5 == md5_val,
-                    ShareFileList.file_name == filename,
-                )
-                .values(pv=ShareFileList.pv + 1)
-            )
-
-        await db.commit()
-
-    if shared == 1:
-        fileid = f"{md5_val}{filename}"
-        await redis.zincrby(FILE_PUBLIC_ZSET, 1, fileid)
 
     return {"code": 0}
 

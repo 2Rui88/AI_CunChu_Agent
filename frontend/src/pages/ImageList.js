@@ -5,7 +5,7 @@ import {
 } from '@ant-design/icons';
 import styled from '@emotion/styled';
 import { useAuth } from '../contexts/AuthContext';
-import { fetchUserImages, uploadImage, deleteImage, shareFile, cancelShareFile, pvFile } from '../services/images';
+import { fetchUserImages, uploadImage, deleteImage, shareFile, cancelShareFile } from '../services/images';
 import { describeFileByMd5 } from '../services/ai';
 import { IMAGE_EXTS } from '../utils/format';
 
@@ -99,11 +99,6 @@ const ImageMeta = styled.div`
     white-space: nowrap;
     overflow: hidden;
     text-overflow: ellipsis;
-  }
-  .pv {
-    font-size: 12px;
-    color: #8c95a3;
-    margin-top: 2px;
   }
 `;
 
@@ -216,8 +211,7 @@ const ImageList = () => {
     }
   };
 
-  const handleDownload = async (image) => {
-    pvFile(image, user).catch(() => {});
+  const handleDownload = (image) => {
     const link = document.createElement('a');
     link.href = image.url;
     link.download = image.name;
@@ -299,7 +293,6 @@ const ImageList = () => {
               </ImageWrap>
               <ImageMeta>
                 <div className="name" title={image.name}>{image.name}</div>
-                <div className="pv">下载 {image.pv || 0} 次</div>
               </ImageMeta>
             </GalleryCard>
           </Col>
