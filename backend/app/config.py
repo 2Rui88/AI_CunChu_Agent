@@ -31,7 +31,10 @@ class Settings(BaseSettings):
         "embeddings/multimodal-embedding/multimodal-embedding"
     )
     # 模型名称
-    vl_model: str = "qwen3.5-omni-flash"                                     # 视觉理解模型
+    # VL：qwen3.8-omni-flash（2026-09 上线）所有模态输入统一 0.8 元/百万token、输出 2.7，
+    #     纯图片理解场景下比 qwen3.5-omni-flash（图片输入 18 元/输出 13.3 元）便宜约 95%；
+    #     如遇调用不兼容，用环境变量 VL_MODEL=qwen3.5-omni-flash 即时回退
+    vl_model: str = "qwen3.8-omni-flash"                                   # 视觉理解模型
     embedding_model: str = "tongyi-embedding-vision-flash-2026-03-06"   # 文本向量化模型
     chat_model: str = "qwen3.5-flash"                                    # Agent 对话模型
     # 参数

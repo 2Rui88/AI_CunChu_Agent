@@ -233,7 +233,7 @@ tc_nginx   :443/80   Nginx 反向代理
 | 配置项 | 默认值 | 说明 |
 |--------|--------|------|
 | `embedding_model` | tongyi-embedding-vision-flash | 向量化模型 |
-| `vl_model` | qwen3.5-omni-flash | 视觉理解模型 |
+| `vl_model` | qwen3.8-omni-flash | 视觉理解模型（全模态统一价，图片描述成本约为上代的 1/20） |
 | `chat_model` | qwen3.5-flash | Agent 对话模型 |
 | `embedding_dimension` | 768 | 向量维度 |
 | `embedding_max_chars` | 3000 | 单切片最大字符数（分块阈值） |
