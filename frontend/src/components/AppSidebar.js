@@ -8,6 +8,7 @@ import {
   TrophyOutlined,
   LogoutOutlined,
   CloudUploadOutlined,
+  ApartmentOutlined,
 } from '@ant-design/icons';
 import styled from '@emotion/styled';
 import { useNavigate, useLocation } from 'react-router-dom';
@@ -93,6 +94,7 @@ const MENU_ITEMS = [
   { key: '/images', icon: <PictureOutlined />, label: '图片库' },
   { key: '/shared', icon: <ShareAltOutlined />, label: '共享广场' },
   { key: '/top-downloads', icon: <TrophyOutlined />, label: '下载排行' },
+  { key: '/vector-docs', icon: <ApartmentOutlined />, label: '向量化文档' },
 ];
 
 export default function AppSidebar() {

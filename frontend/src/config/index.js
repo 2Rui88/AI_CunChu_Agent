@@ -14,6 +14,8 @@ export const API_CONFIG = {
     CHUNK_MERGE: '/api/chunk_merge',
     AI: '/api/ai',
     AGENT: '/api/agent',
+    VECTOR_DOCS: '/api/vector/docs',
+    VECTOR_CHUNKS: '/api/vector/chunks',
   },
   CHUNK_SIZE: 10 * 1024 * 1024,        // 10MB per chunk
   CHUNK_THRESHOLD: 10 * 1024 * 1024,   // files > 10MB use chunked upload

@@ -9,6 +9,7 @@ import ImageList from './pages/ImageList';
 import FileList from './pages/FileList';
 import SharedFiles from './pages/SharedFiles';
 import TopDownloads from './pages/TopDownloads';
+import VectorDocs from './pages/VectorDocs';
 import { AuthProvider, useAuth } from './contexts/AuthContext';
 
 const { Content } = Layout;
@@ -39,6 +40,7 @@ const PAGE_META = {
   '/images': { title: '图片库', desc: '图片上传与图床分享，AI 自动生成图片描述' },
   '/shared': { title: '共享广场', desc: '其他用户分享的文件，可转存到自己的空间' },
   '/top-downloads': { title: '下载排行', desc: '全站共享文件下载量 TOP 10' },
+  '/vector-docs': { title: '向量化文档', desc: '只读查看已建立语义索引的文档、切分与向量化结果，便于校验' },
 };
 
 const PrivateRoute = ({ children }) => {
@@ -64,6 +66,7 @@ function MainLayout() {
               <Route path="/images" element={<PrivateRoute><ImageList /></PrivateRoute>} />
               <Route path="/shared" element={<PrivateRoute><SharedFiles /></PrivateRoute>} />
               <Route path="/top-downloads" element={<PrivateRoute><TopDownloads /></PrivateRoute>} />
+              <Route path="/vector-docs" element={<PrivateRoute><VectorDocs /></PrivateRoute>} />
               <Route path="*" element={<Navigate to="/" replace />} />
             </Routes>
           </div>

@@ -3,7 +3,7 @@ from contextlib import asynccontextmanager
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from app.config import settings
-from app.routers import auth, files, chunk, share, ai, agent
+from app.routers import auth, files, chunk, share, ai, agent, vector_docs
 from app.database import init_db
 from app.minio_client import ensure_bucket
 
@@ -39,6 +39,7 @@ app.include_router(chunk.router)
 app.include_router(share.router)
 app.include_router(ai.router)
 app.include_router(agent.router)
+app.include_router(vector_docs.router)
 
 
 @app.get("/api/health")
