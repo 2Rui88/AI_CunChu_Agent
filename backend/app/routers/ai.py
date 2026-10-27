@@ -191,6 +191,8 @@ async def ai_describe(body: dict):
                     UserFileAiDesc.user == user, UserFileAiDesc.md5 == md5_val
                 )
             )
+            # 旧切片向量仍在 FAISS 索引中，标记脏让下次搜索前自动重建，防止幽灵向量堆积
+            mark_dirty(user)
 
         # 生成描述（返回 描述文本 + 结构化 metadata + 是否为降级存根）
         description, metadata, is_stub = await _generate_description(
@@ -202,9 +204,23 @@ async def ai_describe(body: dict):
         # 分块 + 逐块向量化 + 存储（传入 metadata 供 PDF/Excel 切分器使用）
         chunks = chunk_text(file_type, description, metadata=metadata)
         if is_stub:
-            # 降级存根统一打标：搜索结果以"未索引内容"标签呈现，前端可提示手动补索引
+            # 降级存根不入语义索引：无内容信息，向量化只会污染搜索结果，
+            # 也无需花费 embedding 调用。只落文本（供展示/手动重建入口判断），embedding 置空。
             for ch in chunks:
                 ch.context_label = "未索引内容"
+                await _upsert_file_ai_desc(db, md5_val, ch.text, None,
+                                           ch.index, ch.context_label)
+                await _upsert_user_ai_desc(db, user, md5_val, ch.text, None,
+                                           ch.index, ch.context_label)
+            await db.commit()
+            if force:
+                # force 重建为存根时同样需要清掉旧向量
+                try:
+                    mark_dirty(user)
+                except Exception:
+                    pass
+            return {"code": 0, "msg": "ok"}
+
         vecs: list[np.ndarray] = []
 
         for ch in chunks:
@@ -223,8 +239,11 @@ async def ai_describe(body: dict):
             await _upsert_user_ai_desc(db, user, md5_val, ch.text, vec,
                                        ch.index, ch.context_label)
 
-        # FAISS 逐块写入（commit 前，保证一致性）；磁盘操作挪线程池避免阻塞事件循环
+        # FAISS 逐块写入；磁盘操作挪线程池避免阻塞事件循环。
+        # 注意：必须先显式 flush 让 upsert 的行真正落库——
+        # execute(text UPDATE) 不会触发 autoflush，否则回写 faiss_id 会因行不存在而静默丢失
         try:
+            await db.flush()
             for i, ch in enumerate(chunks):
                 faiss_id = await asyncio.to_thread(add_vector, user, vecs[i])
                 await db.execute(
@@ -579,6 +598,8 @@ async def _copy_cache_to_user(db, user: str, md5_val: str, caches: list) -> dict
         await _upsert_user_ai_desc(db, user, md5_val, cache.description,
                                    vec, cidx, clabel)
 
+        # 同 ai_describe：先 flush 落库，UPDATE 的 faiss_id 回写才能匹配到行
+        await db.flush()
         faiss_id = await asyncio.to_thread(add_vector, user, vec)
         await db.execute(
             text(
@@ -592,9 +613,10 @@ async def _copy_cache_to_user(db, user: str, md5_val: str, caches: list) -> dict
     return {"code": 0, "msg": "ok"}
 
 
-async def _upsert_file_ai_desc(db, md5_val: str, description: str, vec: np.ndarray,
+async def _upsert_file_ai_desc(db, md5_val: str, description: str, vec: np.ndarray | None,
                                chunk_index: int = 0, context_label: str = ""):
-    """写入或更新全局 AI 描述缓存（按 md5 + chunk_index 唯一）"""
+    """写入或更新全局 AI 描述缓存（按 md5 + chunk_index 唯一）；vec=None 表示存根行，不参与向量索引"""
+    emb = vec.tobytes() if vec is not None else None
     result = await db.execute(
         select(FileAiDesc).where(
             FileAiDesc.md5 == md5_val, FileAiDesc.chunk_index == chunk_index
@@ -603,14 +625,14 @@ async def _upsert_file_ai_desc(db, md5_val: str, description: str, vec: np.ndarr
     existing = result.scalar()
     if existing:
         existing.description = description
-        existing.embedding = vec.tobytes()
+        existing.embedding = emb
         existing.context_label = context_label
         existing.model = settings.vl_model
         existing.status = 1
     else:
         db.add(FileAiDesc(
             md5=md5_val, chunk_index=chunk_index,
-            description=description, embedding=vec.tobytes(),
+            description=description, embedding=emb,
             context_label=context_label, model=settings.vl_model, status=1,
         ))
 
