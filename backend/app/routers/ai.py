@@ -11,6 +11,7 @@ rebuild:  从 MySQL 全量重建用户 FAISS 索引
 """
 import io
 import re
+import html
 import asyncio
 import zipfile
 import fitz  # PyMuPDF
@@ -376,7 +377,10 @@ async def _download_and_extract(file_url: str, file_type: str, cap_bytes: int) -
 def _parse_docx(data: bytes) -> str | None:
     """
     解压 docx（ZIP 格式），从 word/document.xml 中提取 <w:t> 标签内的文本。
-    <w:t> 匹配规则：标签名以 w:t 开头，后面是 > 或空格（排除 <w:tab> 等）。
+    <w:t> 属性段必须限定"空格开头"（(?: [^>]*)?）：[^>]* 能匹配 < 和 /，
+    会把无属性 <w:t>文本</w:t> 的闭合标签一起吞进属性段——文本被丢弃、
+    捕获组跨段落抓到 XML 碎片（python-docx 与 Word 均大量输出无属性 w:t）。
+    按段落提取、段落间以 \n 连接，避免相邻段落文字粘连。
     """
     try:
         with zipfile.ZipFile(io.BytesIO(data)) as zf:
@@ -388,9 +392,13 @@ def _parse_docx(data: bytes) -> str | None:
     if not xml_text:
         return None
 
-    # 提取所有 <w:t>...</w:t> 标签中的文本内容
-    parts = re.findall(r"<w:t[ >][^>]*>(.*?)</w:t>", xml_text)
-    text = "".join(parts).strip()
+    paras = []
+    # <w:p[ >] 排除 <w:pPr>/<w:pStyle>；<w:p/> 自闭合空段落自然跳过
+    for p_match in re.finditer(r"<w:p[ >].*?</w:p>", xml_text, re.DOTALL):
+        parts = re.findall(r"<w:t(?: [^>]*)?>(.*?)</w:t>", p_match.group())
+        if parts:
+            paras.append(html.unescape("".join(parts)))
+    text = "\n".join(paras).strip()
     return text if text else None
 
 
