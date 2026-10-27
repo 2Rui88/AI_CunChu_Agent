@@ -6,7 +6,8 @@ describe: 生成文件 AI 描述 + 向量 → 存入 MySQL + FAISS
   - 文本(txt/md/py/...) → 下载读取内容作为描述
   - docx → 解压提取 XML 文本作为描述
   - 其他 → 类型 + 文件名拼接描述
-search:   自然语言查询 → embedding → FAISS 检索 → 回查 MySQL 返回结果
+search:   语义搜索引擎 semantic_search（查询改写 + 双路召回 + RRF + 重排），
+          不再暴露独立 HTTP 端点——对话助手 search_files 工具是唯一调用方
 rebuild:  从 MySQL 全量重建用户 FAISS 索引
 """
 import io
@@ -933,28 +934,21 @@ async def _rerank_with_llm(query: str, files: list[dict], api_key: str) -> list[
 
 # ============================================================
 #  search —— AI 语义搜索（含双路召回 + 去重合并）
+#  独立搜索框与 /ai/search 端点已移除；本引擎由 AI 助手的
+#  search_files 工具调用（agent_tools.tool_search_files）。
 # ============================================================
 
-@router.post("/ai/search")
-async def ai_search(body: dict):
+async def semantic_search(user: str, query: str, top_k: int = 10,
+                          api_key: str | None = None) -> dict:
     """
-    AI 语义搜索 —— 将查询文本向量化后在用户 FAISS 索引中检索，
-    按余弦相似度过滤后回查 MySQL 联表返回结果。
-    需要: user, token, query；API Key 由服务端统一配置
+    语义搜索全链路（全站唯一检索实现）：
+    脏索引自动重建 → 查询特征检测/分类/改写 → FAISS 向量召回 →
+    MySQL 关键词路 → RRF 双路融合 → LLM 重排序。
+    返回 {"code": 0, "count": n, "files": [...]} 或 {"code": 1, "msg": ...}
     """
-    user = body.get("user", "")
-    token = body.get("token", "")
-    if not await check_token(user, token):
-        return {"code": 4}
-
-    query = body.get("query", "")
     # 密钥统一取服务端配置（客户端传入的 api_key 一律忽略，防泄露）
-    api_key = settings.dashscope_api_key
-    # top_k 钳制到 1..50，防异常值放大检索与重排成本
-    try:
-        top_k = max(1, min(int(body.get("top_k", 10) or 10), 50))
-    except (TypeError, ValueError):
-        top_k = 10
+    if api_key is None:
+        api_key = settings.dashscope_api_key
 
     if not query:
         return {"code": 1, "msg": "missing query"}

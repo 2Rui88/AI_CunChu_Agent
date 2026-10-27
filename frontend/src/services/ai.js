@@ -35,30 +35,5 @@ export const describeFileByMd5 = async (md5, filename, type, user) => {
   return data;
 };
 
-/**
- * AI 语义搜索（密钥由服务端统一配置）
- */
-export const aiSearch = async (query, user) => {
-  const body = {
-    user: user.username,
-    token: user.token,
-    query: query
-  };
-
-  const response = await fetch(`${AI_ENDPOINT}/search`, {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify(body)
-  });
-
-  const data = await response.json();
-  if (data.code === 4) {
-    const err = new Error('token expired');
-    err.tokenExpired = true;
-    throw err;
-  }
-  if (data.code !== 0) {
-    throw new Error(data.msg || '搜索失败');
-  }
-  return data;
-};
+// 注：语义搜索已并入 AI 助手对话（/api/agent/chat 的 search_files 工具），
+// 独立的 /ai/search 端点与前端 aiSearch 已移除。

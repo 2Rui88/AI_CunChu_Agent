@@ -1,5 +1,5 @@
 import React, { useState, useRef, useEffect, useCallback } from 'react';
-import { Drawer, Input, Button, Avatar, Tooltip, Typography, Spin, Empty, Tag } from 'antd';
+import { Card, Input, Button, Avatar, Tooltip, Typography, Spin, Empty, Tag } from 'antd';
 import {
   SendOutlined, PlusOutlined, RobotOutlined, ToolOutlined,
 } from '@ant-design/icons';
@@ -11,7 +11,7 @@ import { useAuth } from '../contexts/AuthContext';
 const { Text } = Typography;
 
 const MsgList = styled.div`
-  flex: 1;
+  height: 520px;
   overflow-y: auto;
   padding: 16px;
   display: flex;
@@ -99,7 +99,59 @@ const SUGGESTIONS = [
   '我的存储空间用了多少',
 ];
 
-export default function ChatPanel({ open, onClose }) {
+// ── 轻量富文本渲染：Markdown 链接/裸 URL 转可点击 <a>，**加粗** 转 <strong> ──
+// 不引入 markdown 库：助手输出以短句+链接为主，文本节点经 React 转义无 XSS 面，
+// 链接一律 target=_blank + rel=noopener 且仅放行 http(s)。
+const MD_LINK_RE = /\[([^\]]*)\]\((https?:\/\/[^)\s]+)\)/g;
+// 排除中文字符与中日韩标点，避免"URL 后紧跟中文无空格"时把中文吞进链接
+const BARE_URL_RE = /https?:\/\/[^\s<>()\u4e00-\u9fff\u3000-\u303f\uff00-\uffef]+/g;
+
+function pushPlainText(text, parts) {
+  text.split(/(\*\*[^*]+\*\*)/g).forEach((seg) => {
+    if (!seg) return;
+    if (seg.startsWith('**') && seg.endsWith('**')) {
+      parts.push(<strong key={parts.length}>{seg.slice(2, -2)}</strong>);
+      return;
+    }
+    let last = 0;
+    let mm;
+    BARE_URL_RE.lastIndex = 0;
+    while ((mm = BARE_URL_RE.exec(seg)) !== null) {
+      if (mm.index > last) parts.push(seg.slice(last, mm.index));
+      parts.push(
+        <a key={parts.length} href={mm[0]} target="_blank" rel="noopener noreferrer">
+          {mm[0]}
+        </a>
+      );
+      last = mm.index + mm[0].length;
+    }
+    if (last < seg.length) parts.push(seg.slice(last));
+  });
+}
+
+function renderRich(content) {
+  const parts = [];
+  let last = 0;
+  let m;
+  MD_LINK_RE.lastIndex = 0;
+  while ((m = MD_LINK_RE.exec(content)) !== null) {
+    pushPlainText(content.slice(last, m.index), parts);
+    parts.push(
+      <a key={parts.length} href={m[2]} target="_blank" rel="noopener noreferrer">
+        {m[1]}
+      </a>
+    );
+    last = m.index + m[0].length;
+  }
+  pushPlainText(content.slice(last), parts);
+  return parts;
+}
+
+/**
+ * AI 文件助手（首页主体，全站唯一的文件搜索入口）
+ * 找文件直接在对话里描述内容即可；助手同时负责文件管理操作与危险操作确认。
+ */
+export default function AssistantChat() {
   const { user, logout } = useAuth();
   const [messages, setMessages] = useState([]);
   const [input, setInput] = useState('');
@@ -188,10 +240,12 @@ export default function ChatPanel({ open, onClose }) {
           <ToolOutlined style={{ color: '#2563eb' }} />
           <span style={{ fontWeight: 600 }}>{m.toolName}</span>
           {m.toolArgs?.query && <Tag style={{ marginInlineEnd: 0 }}>{m.toolArgs.query}</Tag>}
+          {m.toolArgs?.identifier && <Tag style={{ marginInlineEnd: 0 }}>{m.toolArgs.identifier}</Tag>}
+          {m.toolArgs?.count && <Tag style={{ marginInlineEnd: 0 }}>{m.toolArgs.count} 条</Tag>}
           {r ? (
             r.error ? <Text type="danger">失败：{r.error}</Text>
               : r.canceled ? <Text type="secondary">已取消</Text>
-              : <Text type="success" style={{ color: '#16a34a' }}>完成</Text>
+              : <Text style={{ color: '#16a34a' }}>完成</Text>
           ) : <Spin size="small" />}
         </ToolCard>
       );
@@ -213,40 +267,32 @@ export default function ChatPanel({ open, onClose }) {
             {isUser ? (user?.username || '?').slice(0, 1).toUpperCase() : undefined}
           </Avatar>
         </AvatarWrap>
-        <Bubble $isUser={isUser}>{m.content}</Bubble>
+        <Bubble $isUser={isUser}>{isUser ? m.content : renderRich(m.content)}</Bubble>
       </BubbleRow>
     );
   };
 
   return (
-    <Drawer
-      open={open}
-      onClose={onClose}
-      placement="right"
-      width={432}
-      mask={false}
-      title={
+    <Card style={{ borderRadius: 14 }}>
+      <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: 4 }}>
         <div style={{ display: 'flex', alignItems: 'center', gap: 10 }}>
           <Avatar size={34} style={{ background: 'linear-gradient(135deg, #2563eb, #7c3aed)' }} icon={<RobotOutlined />} />
           <div>
             <div style={{ fontWeight: 700, fontSize: 15 }}>AI 文件助手</div>
-            <Text type="secondary" style={{ fontSize: 12 }}>语义搜索 · 工具调用 · 危险操作确认</Text>
+            <Text type="secondary" style={{ fontSize: 12 }}>语义搜索 · 文件管理 · 危险操作确认</Text>
           </div>
         </div>
-      }
-      extra={
         <Tooltip title="新建对话">
           <Button size="small" icon={<PlusOutlined />} onClick={handleNewChat} disabled={streaming} />
         </Tooltip>
-      }
-      styles={{ body: { padding: 0, display: 'flex', flexDirection: 'column', background: '#f7f9fc' } }}
-    >
+      </div>
+
       <MsgList>
         {messages.length === 0 && !thinking && (
           <div style={{ marginTop: 48 }}>
             <Empty
               image={Empty.PRESENTED_IMAGE_SIMPLE}
-              description={<Text type="secondary">问我关于你文件的任何问题</Text>}
+              description={<Text type="secondary">描述你想找的文件，或让我帮你管理文件</Text>}
             >
               <SuggestBox>
                 {SUGGESTIONS.map((s) => (
@@ -283,7 +329,7 @@ export default function ChatPanel({ open, onClose }) {
               handleSend();
             }
           }}
-          placeholder="输入消息，例如：帮我找上个月的技术方案"
+          placeholder="用自然语言描述你想找的文件，或让我统计、分享、删除文件..."
           autoSize={{ minRows: 1, maxRows: 4 }}
           disabled={streaming}
           style={{ flex: 1 }}
@@ -309,6 +355,6 @@ export default function ChatPanel({ open, onClose }) {
         onConfirm={handleConfirm}
         onCancel={handleConfirm}
       />
-    </Drawer>
+    </Card>
   );
 }

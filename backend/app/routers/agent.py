@@ -25,10 +25,10 @@ from app.minio_client import presign_url, BUCKET
 router = APIRouter(prefix="/api/agent", tags=["agent"])
 
 # ── 系统提示词 ──
-SYSTEM_PROMPT = """你是 AI云存储 的文件管理助手。你可以帮助用户管理他们的文件。
+SYSTEM_PROMPT = """你是 AI云存储 的文件管理助手，也是用户查找文件的唯一入口。你可以帮助用户搜索和管理他们的文件。
 
 你的能力:
-- 语义搜索文件（search_files）
+- 语义搜索文件（search_files，全链路：查询改写 + 双路召回 + 重排序）
 - 查看文件详细信息（get_file_info）
 - 列出最近上传的文件（list_recent_files）
 - 查看存储统计（get_storage_stats）
@@ -37,12 +37,13 @@ SYSTEM_PROMPT = """你是 AI云存储 的文件管理助手。你可以帮助用
 - 删除文件（delete_file）—— 需要用户确认
 
 规则:
-- 优先使用 search_files 查找文件
+- 用户想找文件时，优先使用 search_files，不需要引导他去别处
+- 需要定位具体文件时，可用 list_recent_files，或按用户提供的文件名/MD5 调用 get_file_info
 - 删除和分享前必须先向用户确认
 - 回答要简洁，引用具体文件名和细节
-- 引用搜索结果中的文件时，附带文件的 URL 链接
+- 引用文件时，用 Markdown 链接格式 [文件名](URL) 附带下载链接，URL 必须原样使用工具结果中给出的链接，不得改写、缩写或省略问号后的任何参数
 - 如果搜索结果有 match_context，用它标注文件中的具体位置
-- 如果搜索无结果，建议用户尝试不同描述词
+- 如果搜索无结果，建议用户尝试不同的描述词
 - 始终使用中文回复"""
 
 # ── 危险操作确认（Redis 实现，跨 gunicorn worker 共享）──
@@ -114,7 +115,7 @@ def _tool_definitions() -> list[dict]:
     return [
         {"type": "function", "function": {
             "name": "search_files",
-            "description": "语义搜索用户文件",
+            "description": "语义搜索用户文件（全站唯一搜索入口，自然语言描述即可）",
             "parameters": {"type": "object", "properties": {
                 "query": {"type": "string", "description": "搜索关键词或自然语言描述"},
                 "top_k": {"type": "integer", "description": "返回数量(默认5)", "default": 5},

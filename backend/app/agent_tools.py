@@ -9,10 +9,13 @@ Agent 工具集 —— 7 个文件操作工具，供 ReAct Agent Loop 调用
   READ:        search_files, get_file_info, list_recent_files,
                get_storage_stats, describe_file
   DESTRUCTIVE: delete_file, share_file（需用户二次确认）
+
+注：对话式助手是全站唯一的文件搜索入口——search_files 委托
+    ai.semantic_search 全链路（查询改写 + 双路召回 + RRF + 重排），
+    独立的搜索框与 /ai/search 端点已移除。
 """
 import re
 import asyncio
-import numpy as np
 from sqlalchemy import select, delete as sql_delete
 from app.database import Session
 from app.models import (
@@ -20,14 +23,7 @@ from app.models import (
     ShareFileList, UserFileAiDesc, FileAiDesc,
 )
 from app.redis_client import redis
-from app.config import settings
-from app.dashscope_client import get_embedding
-from app.faiss_service import (
-    search as faiss_search,
-    add_vector,
-    l2_normalize, get_ntotal,
-    mark_dirty,
-)
+from app.faiss_service import mark_dirty
 from app.minio_client import client as minio_client, BUCKET, presign_from_db_url
 
 # ── 危险操作集合（Agent 确认门控用）──
@@ -62,74 +58,33 @@ def _get_suffix(filename: str) -> str:
 
 async def tool_search_files(username: str, **kwargs) -> dict:
     """
-    语义搜索用户文件。
+    语义搜索用户文件（全站唯一搜索入口）。
     LLM 参数: query (str), top_k (int, 可选, 默认5)
+    检索委托 ai.semantic_search 全链路：查询改写 + 双路召回 + RRF 融合 + 重排序。
     """
     query = kwargs.get("query", "")
-    # top_k 钳制（LLM 给出的参数不可信），过量召回后按 top_k 截断输出
+    # top_k 钳制（LLM 给出的参数不可信）
     try:
         top_k = max(1, min(int(kwargs.get("top_k", 5) or 5), 20))
     except (TypeError, ValueError):
         top_k = 5
-    # 密钥统一取服务端配置（不经过 LLM 参数/客户端请求）
-    api_key = settings.dashscope_api_key
-    if not api_key:
-        return {"error": "AI 服务未配置，请联系管理员"}
     if not query:
         return {"error": "missing query"}
 
-    try:
-        embedding = await get_embedding(api_key, query)
-        query_vec = np.array(embedding, dtype=np.float32)
-    except Exception as exc:
-        return {"error": f"embedding failed: {exc}"}
+    # 懒加载避免 agent 工具模块与路由模块的循环导入
+    from app.routers.ai import semantic_search
 
-    try:
-        results = await asyncio.to_thread(faiss_search, username, query_vec, max(top_k, 20))
-    except Exception as exc:
-        return {"error": f"faiss search failed: {exc}"}
+    result = await semantic_search(username, query, top_k=top_k)
+    if result.get("code") != 0:
+        return {"error": result.get("msg", "search failed")}
 
-    if not results:
+    files = result.get("files", [])[:top_k]
+    # 压缩描述：仅保留描述的前两句，减少 LLM token 消耗
+    for f in files:
+        f["description"] = _compress_description(f.get("description") or "")
+
+    if not files:
         return {"count": 0, "files": [], "message": "没有找到匹配的文件"}
-
-    files = []
-    try:
-        async with Session() as db:
-            for faiss_id, score in results:
-                if score < 0.45:
-                    continue
-                if len(files) >= top_k:
-                    break
-                result = await db.execute(
-                    select(UserFileAiDesc, UserFileList, FileInfo)
-                    .join(UserFileList,
-                          (UserFileList.user == UserFileAiDesc.user) &
-                          (UserFileList.md5 == UserFileAiDesc.md5))
-                    .join(FileInfo, FileInfo.md5 == UserFileAiDesc.md5)
-                    .where(
-                        UserFileAiDesc.user == username,
-                        UserFileAiDesc.faiss_id == faiss_id,
-                        UserFileAiDesc.status == 1,
-                    ).limit(1)
-                )
-                row = result.first()
-                if row:
-                    uad, ufl, fi = row
-                    # 压缩描述：仅保留描述的前两句，减少 LLM token 消耗
-                    compressed = _compress_description(uad.description)
-                    files.append({
-                        "md5": uad.md5,
-                        "filename": ufl.file_name,
-                        "description": compressed,
-                        "url": presign_from_db_url(fi.url),      # 引用溯源（限时签名链接）
-                        "size": str(fi.size),
-                        "type": fi.type,
-                        "score": round(score, 4),
-                        "match_context": uad.context_label or "",  # 命中位置
-                    })
-    except Exception as exc:
-        return {"error": f"database query failed: {exc}"}
-
     return {"count": len(files), "files": files}
 
 
