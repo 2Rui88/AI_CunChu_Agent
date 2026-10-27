@@ -36,3 +36,6 @@ docker/nginx_fastdfs/front/
 # ZCode 工具本地配置（编辑器私有，不入库）
 .zcodeignore
 .zcode/
+
+# 测试文档生成产物（testdocs/gen_docs.py 输出，不入库）
+testdocs/out/
