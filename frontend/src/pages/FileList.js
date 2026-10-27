@@ -87,10 +87,9 @@ const FileList = () => {
       } else {
         message.success('上传成功！');
       }
-      const apiKey = localStorage.getItem('dashscope_api_key_' + user.username) || '';
       if (result.md5) {
         const ext = (file.name.split('.').pop() || '').toLowerCase();
-        describeFileByMd5(result.md5, file.name, ext, user, apiKey).catch(() => {});
+        describeFileByMd5(result.md5, file.name, ext, user).catch(() => {});
       }
       fetchFiles();
     } catch (error) {
@@ -156,11 +155,6 @@ const FileList = () => {
   );
 
   const handleBuildIndex = (record) => {
-    const apiKey = localStorage.getItem('dashscope_api_key_' + user.username) || '';
-    if (!apiKey) {
-      message.warning('请先在首页设置 DashScope API Key');
-      return;
-    }
     const isBig = Number(record.size) > API_CONFIG.CONTENT_INDEX_LIMIT;
     Modal.confirm({
       title: '建立内容索引',
@@ -173,7 +167,7 @@ const FileList = () => {
         const msgKey = 'buildIndex';
         message.loading({ content: '正在提取内容并建立索引...', key: msgKey, duration: 0 });
         try {
-          await describeFileByMd5(record.md5, record.file_name, record.type, user, apiKey);
+          await describeFileByMd5(record.md5, record.file_name, record.type, user);
           message.success({ content: '内容索引已建立，现在可以按内容搜索该文件', key: msgKey });
         } catch (err) {
           if (err.tokenExpired) {

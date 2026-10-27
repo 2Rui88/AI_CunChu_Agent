@@ -6,7 +6,6 @@ import {
 import styled from '@emotion/styled';
 import ConfirmModal from './ConfirmModal';
 import { startChatStream, confirmAction } from '../services/agent';
-import { fetchApiKey } from '../services/ai';
 import { useAuth } from '../contexts/AuthContext';
 
 const { Text } = Typography;
@@ -108,11 +107,9 @@ export default function ChatPanel({ open, onClose }) {
   const [thinking, setThinking] = useState(false);
   const [currentConvId, setCurrentConvId] = useState(null);
   const [confirmData, setConfirmData] = useState(null);
-  const [apiKey, setApiKey] = useState('');
   const abortRef = useRef(null);
   const endRef = useRef(null);
 
-  useEffect(() => { fetchApiKey(user).then(setApiKey); }, [user]);
   useEffect(() => { endRef.current?.scrollIntoView({ behavior: 'smooth' }); }, [messages, thinking]);
 
   const addMsg = useCallback((msg) => setMessages((p) => [...p, msg]), []);
@@ -120,16 +117,12 @@ export default function ChatPanel({ open, onClose }) {
   const handleSend = useCallback(async () => {
     const text = input.trim();
     if (!text || streaming) return;
-    if (!apiKey) {
-      addMsg({ role: 'system', content: '请先在首页设置 DashScope API Key' });
-      return;
-    }
     setInput('');
     setStreaming(true);
     setThinking(true);
     addMsg({ role: 'user', content: text });
 
-    abortRef.current = startChatStream(text, currentConvId, user, apiKey, {
+    abortRef.current = startChatStream(text, currentConvId, user, {
       onThinking: () => setThinking(true),
       onToolCall: (d) => {
         setThinking(false);
@@ -167,7 +160,7 @@ export default function ChatPanel({ open, onClose }) {
         if (d.conv_id) setCurrentConvId(d.conv_id);
       },
     });
-  }, [input, streaming, apiKey, currentConvId, user, addMsg, logout]);
+  }, [input, streaming, currentConvId, user, addMsg, logout]);
 
   const handleConfirm = useCallback(async (token, decision) => {
     setConfirmData(null);

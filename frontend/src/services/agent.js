@@ -3,10 +3,10 @@ import { API_CONFIG } from '../config';
 const AGENT_BASE = `${API_CONFIG.BASE_URL}/api/agent`;
 
 /**
- * 启动 SSE 对话流
+ * 启动 SSE 对话流（AI 密钥由服务端统一配置，前端不携带）
  * @returns {AbortController} 用于中断连接
  */
-export const startChatStream = (message, convId, user, apiKey, callbacks) => {
+export const startChatStream = (message, convId, user, callbacks) => {
   const { onThinking, onToolCall, onToolResult, onMessage, onConfirmRequired, onError, onDone } = callbacks;
   const controller = new AbortController();
 
@@ -16,7 +16,6 @@ export const startChatStream = (message, convId, user, apiKey, callbacks) => {
     body: JSON.stringify({
       user: user.username,
       token: user.token,
-      api_key: apiKey,
       message,
       conversation_id: convId || null,
     }),

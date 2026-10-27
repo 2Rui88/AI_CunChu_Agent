@@ -23,6 +23,5 @@ export const API_CONFIG = {
 };
 
 export const STORAGE_KEYS = {
-  API_KEY_PREFIX: 'dashscope_api_key_',
   USER: 'yuncunchu_user',
 };

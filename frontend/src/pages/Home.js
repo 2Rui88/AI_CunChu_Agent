@@ -1,13 +1,13 @@
-import React, { useState, useEffect } from 'react';
+import React, { useState } from 'react';
 import {
-  Card, Input, Button, Tag, Typography, message, Empty, Spin, Space, Modal, Progress,
+  Card, Input, Tag, Typography, message, Empty, Spin, Space, Progress,
 } from 'antd';
 import {
-  SearchOutlined, KeyOutlined, LinkOutlined, EditOutlined, CheckCircleOutlined,
+  SearchOutlined, LinkOutlined,
 } from '@ant-design/icons';
 import styled from '@emotion/styled';
 import { useAuth } from '../contexts/AuthContext';
-import { fetchApiKey, saveApiKey, aiSearch } from '../services/ai';
+import { aiSearch } from '../services/ai';
 import { formatFileSize, getFileIcon } from '../utils/format';
 
 const { Text, Paragraph } = Typography;
@@ -62,16 +62,6 @@ const Chip = styled.span`
   }
 `;
 
-const KeyBar = styled.div`
-  display: flex;
-  align-items: center;
-  justify-content: center;
-  gap: 10px;
-  margin-top: 18px;
-  font-size: 13px;
-  color: #8c95a3;
-`;
-
 const ResultCard = styled(Card)`
   border-radius: 14px;
   margin-bottom: 14px;
@@ -87,37 +77,19 @@ const sourceColor = { 向量路: 'geekblue', 关键词路: 'orange', 双路混�
 
 export default function Home() {
   const { user, logout } = useAuth();
-  const [apiKey, setApiKey] = useState('');
-  const [keyModalOpen, setKeyModalOpen] = useState(false);
-  const [keyInput, setKeyInput] = useState('');
   const [query, setQuery] = useState('');
   const [searching, setSearching] = useState(false);
   const [results, setResults] = useState(null); // null = 未搜索
 
-  useEffect(() => {
-    fetchApiKey(user).then(setApiKey);
-  }, [user]);
-
-  const handleSaveKey = async () => {
-    await saveApiKey(keyInput, user);
-    setApiKey(keyInput);
-    setKeyModalOpen(false);
-    message.success(keyInput ? 'API Key 已保存到本地浏览器' : 'API Key 已清除');
-  };
-
+  // AI 密钥由服务端统一配置；未配置时后端返回明确错误，这里直接透出提示
   const doSearch = async (q) => {
     const text = (q ?? query).trim();
     if (!text) return;
-    if (!apiKey) {
-      setKeyInput('');
-      setKeyModalOpen(true);
-      return;
-    }
     setQuery(text);
     setSearching(true);
     setResults([]);
     try {
-      const data = await aiSearch(text, user, apiKey);
+      const data = await aiSearch(text, user);
       setResults(data.files || []);
     } catch (err) {
       if (err.tokenExpired) {
@@ -156,36 +128,7 @@ export default function Home() {
             <Chip key={s} onClick={() => doSearch(s)}>{s}</Chip>
           ))}
         </Chips>
-
-        <KeyBar>
-          {apiKey
-            ? <CheckCircleOutlined style={{ color: '#16a34a' }} />
-            : <KeyOutlined style={{ color: '#f59e0b' }} />}
-          <span>DashScope API Key：{apiKey ? '已配置' : '未配置（搜索前需设置）'}</span>
-          <Button type="link" size="small" icon={<EditOutlined />} onClick={() => { setKeyInput(apiKey); setKeyModalOpen(true); }}>
-            {apiKey ? '修改' : '去设置'}
-          </Button>
-        </KeyBar>
       </HeroCard>
-
-      <Modal
-        open={keyModalOpen}
-        title={<span><KeyOutlined style={{ marginRight: 8, color: '#2563eb' }} />设置 DashScope API Key</span>}
-        onOk={handleSaveKey}
-        onCancel={() => setKeyModalOpen(false)}
-        okText="保存"
-        cancelText="取消"
-      >
-        <Input.Password
-          value={keyInput}
-          onChange={(e) => setKeyInput(e.target.value)}
-          placeholder="sk-...（阿里百炼 API Key）"
-          size="large"
-        />
-        <Text type="secondary" style={{ fontSize: 12, display: 'block', marginTop: 10 }}>
-          仅保存在本地浏览器（localStorage），用于调用 AI 描述 / 语义搜索 / AI 助手，不会存到服务器数据库。
-        </Text>
-      </Modal>
 
       {searching && (
         <div style={{ textAlign: 'center', padding: 48 }}>

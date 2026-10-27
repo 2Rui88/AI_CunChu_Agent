@@ -20,6 +20,10 @@ export const AuthProvider = ({ children }) => {
   const login = useCallback((username, token) => {
     const u = { username, token };
     localStorage.setItem(STORAGE_KEY, JSON.stringify(u));
+    // 清理旧版"用户自填 API Key"在本地的残留（密钥已改为服务端统一配置）
+    Object.keys(localStorage)
+      .filter((k) => k.startsWith('dashscope_api_key_'))
+      .forEach((k) => localStorage.removeItem(k));
     setUser(u);
   }, []);
 

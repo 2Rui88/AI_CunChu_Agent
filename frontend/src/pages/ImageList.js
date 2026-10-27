@@ -155,10 +155,9 @@ const ImageList = () => {
       } else {
         message.success('上传成功！');
       }
-      const apiKey = localStorage.getItem('dashscope_api_key_' + user.username) || '';
       if (result.md5) {
         const ext = (file.name.split('.').pop() || '').toLowerCase();
-        describeFileByMd5(result.md5, file.name, ext, user, apiKey).catch(() => {});
+        describeFileByMd5(result.md5, file.name, ext, user).catch(() => {});
       }
       fetchImages();
     } catch (error) {

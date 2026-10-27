@@ -1,37 +1,13 @@
 import { API_CONFIG } from '../config';
 
 const AI_ENDPOINT = `${API_CONFIG.BASE_URL}/api/ai`;
-const API_KEY_STORAGE_PREFIX = 'dashscope_api_key_';
 
 /**
- * 从浏览器本地读取 API Key
+ * 对已有文件生成/重建 AI 描述（通过 md5）
+ * 注1：文件 md5 由上传流程（images.js）计算并回传，此处不再重复计算
+ * 注2：AI 密钥由服务端统一配置，前端不再携带
  */
-export const fetchApiKey = async (user) => {
-  if (!user || !user.username) return '';
-  return localStorage.getItem(API_KEY_STORAGE_PREFIX + user.username) || '';
-};
-
-/**
- * 保存 API Key 到浏览器本地
- */
-export const saveApiKey = async (key, user) => {
-  if (!user || !user.username) {
-    throw new Error('用户信息无效');
-  }
-  const storageKey = API_KEY_STORAGE_PREFIX + user.username;
-  if (key) {
-    localStorage.setItem(storageKey, key);
-  } else {
-    localStorage.removeItem(storageKey);
-  }
-  return { code: 0, msg: 'ok' };
-};
-
-/**
- * 对已有文件重新生成 AI 描述（通过 md5）
- * 注：文件 md5 由上传流程（images.js）计算并回传，此处不再重复计算
- */
-export const describeFileByMd5 = async (md5, filename, type, user, apiKey) => {
+export const describeFileByMd5 = async (md5, filename, type, user) => {
   const body = {
     user: user.username,
     token: user.token,
@@ -40,7 +16,6 @@ export const describeFileByMd5 = async (md5, filename, type, user, apiKey) => {
     type: type,
     force: true
   };
-  if (apiKey) body.api_key = apiKey;
 
   const response = await fetch(`${AI_ENDPOINT}/describe`, {
     method: 'POST',
@@ -61,15 +36,14 @@ export const describeFileByMd5 = async (md5, filename, type, user, apiKey) => {
 };
 
 /**
- * AI 语义搜索
+ * AI 语义搜索（密钥由服务端统一配置）
  */
-export const aiSearch = async (query, user, apiKey) => {
+export const aiSearch = async (query, user) => {
   const body = {
     user: user.username,
     token: user.token,
     query: query
   };
-  if (apiKey) body.api_key = apiKey;
 
   const response = await fetch(`${AI_ENDPOINT}/search`, {
     method: 'POST',
