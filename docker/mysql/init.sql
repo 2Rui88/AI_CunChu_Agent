@@ -11,7 +11,6 @@ CREATE TABLE IF NOT EXISTS user_info (
     algo VARCHAR(16) NOT NULL DEFAULT 'md5',     -- 密码算法: md5(旧)/bcrypt
     phone VARCHAR(16) DEFAULT '',
     email VARCHAR(64) DEFAULT '',
-    api_key VARCHAR(256) DEFAULT '',
     create_time TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
 

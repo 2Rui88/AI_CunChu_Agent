@@ -17,7 +17,6 @@ class UserInfo(Base):
     algo = Column(String(16), default="md5", comment="密码算法: md5(旧)/bcrypt")
     phone = Column(String(16), default="")
     email = Column(String(64), default="")
-    api_key = Column(String(256), default="")
     create_time = Column(TIMESTAMP, server_default=text("CURRENT_TIMESTAMP"))
 
 
