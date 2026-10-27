@@ -66,6 +66,7 @@
 - **多格式解析**：PDF（逐页提取+字号检测）、Excel（按工作表+行解析）、Word（解压 XML 提取）、Markdown（标题识别）、代码（函数/类声明识别）
 - **自适应分块**：按文件结构切分——Markdown 按 `##` 标题、代码按函数声明、PDF 按页面、Excel 按工作表，每个切片保留上下文标签
 - **两级缓存**：`file_ai_desc` 全局缓存（跨用户复用）+ `user_file_ai_desc` 用户记录，同一文件只需一次 AI 调用
+- **密钥统一管理**：API Key 仅由部署者配置在环境变量 `DASHSCOPE_API_KEY`，所有用户复用；不落库、不下发前端、不出现在任何响应中
 
 ### AI 语义搜索
 
@@ -126,6 +127,7 @@ cp docker/.env.example docker/.env
 #    编辑 docker/.env：
 #    - 修改 MySQL/MinIO 密码（必填）
 #    - PUBLIC_SERVER_IP 设为服务器 IP/域名（生成预签名下载链接必需）
+#    - DASHSCOPE_API_KEY 填阿里百炼 API Key（AI 功能统一密钥，可选）
 
 # 3. 启动所有服务（前端已内置到 Nginx 镜像的多阶段构建中，无需单独构建）
 cd docker && docker compose up -d --build
@@ -142,8 +144,7 @@ open https://localhost
 
 1. 打开 `https://localhost`（自签名证书需手动信任）
 2. 注册账号并登录
-3. 在首页输入 DashScope API Key 并保存
-4. 上传文件后可使用 AI 搜索和 AI 助手
+3. 上传文件后即可使用 AI 搜索和 AI 助手（AI 密钥由部署者在 docker/.env 统一配置，用户无需也无法填写）
 
 ## 项目结构
 
@@ -240,6 +241,7 @@ tc_nginx   :443/80   Nginx 反向代理
 | `pdf_max_extract_chars` | 8000 | PDF 单次提取最大字符数 |
 | `public_server_ip` | (空) | 公网 IP/域名（预签名下载链接与 DashScope 拉图必需） |
 | `public_server_ssl` | true | 对外地址是否为 HTTPS |
+| `dashscope_api_key` | (空) | AI 统一密钥（环境变量 DASHSCOPE_API_KEY，不落库不下发） |
 | `parse_max_mb` | 100 | 常规内容提取的文件体积安全线（MB），超过退化为文件名存根 |
 | `conversation_ttl_seconds` | 3600 | 对话记忆过期时间 |
 

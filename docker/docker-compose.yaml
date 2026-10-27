@@ -102,6 +102,8 @@ services:
       MINIO_ENDPOINT: minio:9000
       MINIO_ACCESS_KEY: ${MINIO_ROOT_USER}
       MINIO_SECRET_KEY: ${MINIO_ROOT_PASSWORD}
+      # AI 统一密钥（仅存于环境变量，不落库不下发前端）
+      DASHSCOPE_API_KEY: ${DASHSCOPE_API_KEY:-}
       # 对外预签名下载 URL 使用的地址（留空则退化为 MinIO 内网直连端点，仅适合本机调试）
       PUBLIC_SERVER_IP: ${PUBLIC_SERVER_IP:-}
       PUBLIC_SERVER_PORT: ${PUBLIC_SERVER_PORT:-443}
