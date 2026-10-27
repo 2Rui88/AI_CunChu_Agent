@@ -7,9 +7,11 @@ POST /agent/confirm  —— 确认/拒绝危险操作
 工具调用走 DashScope OpenAI 兼容端点 (qwen-plus / qwen3.5-flash)
 """
 import json
+import re
 import uuid
 import asyncio
 import time
+from urllib.parse import unquote
 from fastapi import APIRouter
 from sse_starlette.sse import EventSourceResponse
 from pydantic import BaseModel
@@ -18,6 +20,7 @@ from app.config import settings
 from app.dependencies import check_token
 from app.redis_client import redis
 from app.agent_tools import TOOLS, DESTRUCTIVE_TOOLS
+from app.minio_client import presign_url, BUCKET
 
 router = APIRouter(prefix="/api/agent", tags=["agent"])
 
@@ -49,6 +52,34 @@ CONFIRM_KEY_PREFIX = "agent:confirm:"
 CONFIRM_TTL = 310              # 略长于等待超时，未决确认自动过期清理
 CONFIRM_POLL_INTERVAL = 0.5    # 轮询间隔（秒）
 CONFIRM_WAIT_TIMEOUT = 300     # 等待用户确认的超时（秒）
+
+
+# ── 答案内 /dl/ 下载链接重签 ──
+# 私有桶下载必须带 SigV4 签名，而 LLM 复述工具返回的链接时常丢掉问号后的
+# 签名参数（裸 /dl/ 链接点击 403）。最终答案为整段下发（非逐 token 流式），
+# 这里按链接中的对象路径重新签名替换，保证答案里的链接真实可点、不依赖模型自觉。
+_DL_LINK_RE = re.compile(r"\((\s*)((?:https?://[^)\s]*)?/dl/[^)\s]*)(\s*)\)")
+
+
+def _resign_dl_links(text: str) -> str:
+    """把答案中指向 /dl/ 的下载链接重签为带有效签名的完整 URL。"""
+    def _repl(m: re.Match) -> str:
+        url = m.group(2)
+        if "X-Amz-Signature" in url:
+            return m.group(0)  # 已带签名，原样保留
+        path = url.split("?", 1)[0]
+        marker = f"/dl/{BUCKET}/"
+        pos = path.find(marker)
+        if pos < 0:
+            return m.group(0)
+        object_name = unquote(path[pos + len(marker):])
+        if not object_name:
+            return m.group(0)
+        try:
+            return f"({m.group(1)}{presign_url(object_name)}{m.group(3)})"
+        except Exception:
+            return m.group(0)  # 重签失败退回原文，不阻断回答
+    return _DL_LINK_RE.sub(_repl, text)
 
 
 async def _create_confirmation(token: str, user: str, tool_name: str):
@@ -217,10 +248,10 @@ async def agent_chat(body: ChatRequest):
                 choice = resp.choices[0]
                 msg = choice.message
 
-                # 纯文本响应 → 结束
+                # 纯文本响应 → 结束（重签答案中的下载链接，防 LLM 丢签名参数）
                 if msg.content and not msg.tool_calls:
                     messages.append({"role": "assistant", "content": msg.content})
-                    yield await _sse("message", {"delta": msg.content})
+                    yield await _sse("message", {"delta": _resign_dl_links(msg.content)})
                     break
 
                 # 工具调用

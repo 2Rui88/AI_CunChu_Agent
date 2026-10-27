@@ -3,7 +3,7 @@ MinIO 客户端封装 —— 内部操作客户端 + 预签名 URL 生成
 
 私有桶策略：桶不再设置匿名只读，所有下载（浏览器 / DashScope / 后端自取）
 一律走带签名的限时 URL：
-  - presign_url          对外（浏览器/DashScope），经 nginx /files/ 代理到 MinIO
+  - presign_url          对外（浏览器/DashScope），经 nginx /dl/ 代理到 MinIO
   - presign_internal_url 后端内网自取（文本/PDF/Excel 内容提取）
 """
 from datetime import timedelta
@@ -30,7 +30,7 @@ _sign_client_instance: Minio | None = None
 
 
 def _sign_client() -> Minio:
-    """面向外网的签名客户端：签出的 URL 走 nginx /files/ 代理，Host 与签名一致"""
+    """面向外网的签名客户端：签出的 URL 走 nginx /dl/ 代理，Host 与签名一致"""
     global _sign_client_instance
     if _sign_client_instance is not None:
         return _sign_client_instance
@@ -73,8 +73,10 @@ def db_url_to_object(db_url: str) -> str:
 def presign_url(object_name: str, expires: int = 7200) -> str:
     """
     生成对外预签名下载 URL。
-    原始签出路径为 /{bucket}/{object}，改写为 /files/{bucket}/{object}
-    以命中 nginx 的 /files/ 代理（该代理保留原始 Host，通过 SigV4 校验）。
+    原始签出路径为 /{bucket}/{object}，改写为 /dl/{bucket}/{object}
+    以命中 nginx 的 /dl/ 代理（该代理保留原始 Host，通过 SigV4 校验）。
+    前缀不能叫 /files/：会与前端 SPA 路由 /files 冲突（nginx 对该类 location
+    会把 GET /files 301 成 /files/，页面刷新变成代理 MinIO 根路径）。
     """
     raw = _sign_client().presigned_get_object(
         BUCKET, object_name, expires=timedelta(seconds=expires)
@@ -83,7 +85,7 @@ def presign_url(object_name: str, expires: int = 7200) -> str:
     pos = raw.find(marker)
     if pos < 0:
         return raw
-    return raw[:pos] + "/files" + raw[pos:]
+    return raw[:pos] + "/dl" + raw[pos:]
 
 
 def presign_internal_url(object_name: str, expires: int = 600) -> str:
