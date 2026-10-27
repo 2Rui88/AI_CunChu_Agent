@@ -20,6 +20,9 @@ class Settings(BaseSettings):
     minio_bucket: str = "files"
 
     # ── DashScope ──
+    # 统一服务端密钥：仅在部署环境变量（DASHSCOPE_API_KEY）中配置，由后端自取，
+    # 不落库、不下发前端、不出现在任何 API 响应中
+    dashscope_api_key: str = ""
     dashscope_api_base: str = "https://dashscope.aliyuncs.com/compatible-mode/v1"
     # 原生 API 端点（不走 OpenAI 兼容接口）
     dashscope_vl_url: str = (

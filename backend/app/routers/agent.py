@@ -135,9 +135,9 @@ def _tool_definitions() -> list[dict]:
 class ChatRequest(BaseModel):
     user: str
     token: str
-    api_key: str
     message: str
     conversation_id: str | None = None
+    # 注意：不再接收客户端 api_key —— 统一使用服务端 DASHSCOPE_API_KEY 配置
 
 
 class ConfirmRequest(BaseModel):
@@ -184,6 +184,9 @@ async def agent_chat(body: ChatRequest):
     if not await check_token(body.user, body.token):
         return EventSourceResponse(_error_stream("token error"))
 
+    if not settings.dashscope_api_key:
+        return EventSourceResponse(_error_stream("AI 服务未配置，请联系管理员"))
+
     async def event_generator():
         # 加载或创建对话
         conv_id = body.conversation_id or str(uuid.uuid4())
@@ -192,7 +195,7 @@ async def agent_chat(body: ChatRequest):
             messages.insert(0, {"role": "system", "content": SYSTEM_PROMPT})
         messages.append({"role": "user", "content": body.message})
 
-        client = AsyncOpenAI(api_key=body.api_key, base_url=settings.dashscope_api_base)
+        client = AsyncOpenAI(api_key=settings.dashscope_api_key, base_url=settings.dashscope_api_base)
         tool_count = 0
 
         try:
@@ -279,11 +282,11 @@ async def agent_chat(body: ChatRequest):
                                 yield await _sse("tool_result", {"name": name, "result": result})
                                 continue
 
-                        # 执行工具
+                        # 执行工具（密钥由服务端配置提供，不经过 LLM 参数）
                         handler = TOOLS.get(name)
                         if handler:
                             try:
-                                result = await handler(body.user, api_key=body.api_key, **args)
+                                result = await handler(body.user, **args)
                                 tool_count += 1
                             except Exception as exc:
                                 result = {"error": f"工具执行失败: {exc}"}

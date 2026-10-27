@@ -133,16 +133,17 @@ async def ai_describe(body: dict):
     """
     为指定文件生成 AI 描述和向量，存入 file_ai_desc（全局缓存）和
     user_file_ai_desc（用户记录），并追加到用户 FAISS 索引。
-    需要: user, token, md5, filename, type, api_key
+    需要: user, token, md5, filename, type；API Key 由服务端统一配置
     """
     user = body.get("user", "")
     token = body.get("token", "")
     if not await check_token(user, token):
         return {"code": 4}
 
-    api_key = body.get("api_key", "")
+    # 密钥统一取服务端配置（客户端传入的 api_key 一律忽略，防泄露）
+    api_key = settings.dashscope_api_key
     if not api_key:
-        return {"code": 1, "msg": "missing api_key"}
+        return {"code": 1, "msg": "AI 服务未配置，请联系管理员"}
 
     md5_val = body.get("md5", "")
     filename = body.get("filename", "")
@@ -909,7 +910,7 @@ async def ai_search(body: dict):
     """
     AI 语义搜索 —— 将查询文本向量化后在用户 FAISS 索引中检索，
     按余弦相似度过滤后回查 MySQL 联表返回结果。
-    需要: user, token, query, api_key
+    需要: user, token, query；API Key 由服务端统一配置
     """
     user = body.get("user", "")
     token = body.get("token", "")
@@ -917,15 +918,18 @@ async def ai_search(body: dict):
         return {"code": 4}
 
     query = body.get("query", "")
-    api_key = body.get("api_key", "")
+    # 密钥统一取服务端配置（客户端传入的 api_key 一律忽略，防泄露）
+    api_key = settings.dashscope_api_key
     # top_k 钳制到 1..50，防异常值放大检索与重排成本
     try:
         top_k = max(1, min(int(body.get("top_k", 10) or 10), 50))
     except (TypeError, ValueError):
         top_k = 10
 
-    if not query or not api_key:
-        return {"code": 1, "msg": "missing query or api_key"}
+    if not query:
+        return {"code": 1, "msg": "missing query"}
+    if not api_key:
+        return {"code": 1, "msg": "AI 服务未配置，请联系管理员"}
 
     # 脏标记检测 → 自动重建索引（文件删除后触发）
     if is_dirty(user):

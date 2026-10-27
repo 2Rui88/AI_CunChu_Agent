@@ -71,10 +71,12 @@ async def tool_search_files(username: str, **kwargs) -> dict:
         top_k = max(1, min(int(kwargs.get("top_k", 5) or 5), 20))
     except (TypeError, ValueError):
         top_k = 5
-    api_key = kwargs.get("api_key", "")
-
-    if not query or not api_key:
-        return {"error": "missing query or api_key"}
+    # 密钥统一取服务端配置（不经过 LLM 参数/客户端请求）
+    api_key = settings.dashscope_api_key
+    if not api_key:
+        return {"error": "AI 服务未配置，请联系管理员"}
+    if not query:
+        return {"error": "missing query"}
 
     try:
         embedding = await get_embedding(api_key, query)
