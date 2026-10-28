@@ -1,11 +1,13 @@
 import React, { useState, useRef, useEffect, useCallback } from 'react';
-import { Card, Input, Button, Avatar, Tooltip, Typography, Spin, Empty, Tag } from 'antd';
+import { Card, Input, Button, Avatar, Tooltip, Typography, Spin, Empty, Tag, Popconfirm } from 'antd';
 import {
-  SendOutlined, PlusOutlined, RobotOutlined, ToolOutlined,
+  SendOutlined, PlusOutlined, RobotOutlined, ToolOutlined, DeleteOutlined, StopOutlined,
 } from '@ant-design/icons';
 import styled from '@emotion/styled';
 import ConfirmModal from './ConfirmModal';
-import { startChatStream, confirmAction } from '../services/agent';
+import {
+  startChatStream, confirmAction, listConversations, fetchConversationMessages, deleteConversation,
+} from '../services/agent';
 import { useAuth } from '../contexts/AuthContext';
 
 const { Text } = Typography;
@@ -93,6 +95,52 @@ const SuggestBox = styled.div`
   justify-content: center;
 `;
 
+const ChatLayout = styled.div`
+  display: flex;
+  @media (max-width: 768px) {
+    flex-direction: column;
+  }
+`;
+
+const ConvSidebar = styled.div`
+  width: 216px;
+  flex: none;
+  border-right: 1px solid #eef0f4;
+  overflow-y: auto;
+  max-height: 620px;
+  padding: 8px 6px;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  @media (max-width: 768px) {
+    width: 100%;
+    max-height: 148px;
+    border-right: none;
+    border-bottom: 1px solid #eef0f4;
+  }
+`;
+
+const ConvItem = styled.div`
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  padding: 8px 6px 8px 10px;
+  border-radius: 8px;
+  cursor: pointer;
+  border: 1px solid transparent;
+  &:hover {
+    background: #f5f7fa;
+  }
+  &:hover .del-btn {
+    opacity: 1;
+  }
+  ${(p) => p.$active && 'background: #eff6ff; border-color: #bfdbfe;'}
+  .del-btn {
+    opacity: 0;
+    flex: none;
+  }
+`;
+
 const SUGGESTIONS = [
   '帮我找一下猫的照片',
   '最近上传了什么文件',
@@ -148,8 +196,39 @@ function renderRich(content) {
 }
 
 /**
+ * 服务端消息 → 聊天视图模型。
+ * 库里的 assistant 消息可能只带 tool_calls（无正文），不直接渲染；
+ * 工具名由其 tool_calls 的 id→name 映射回填到后续 tool 消息上。
+ */
+const mapHistoryMessages = (msgs) => {
+  const toolNameById = {};
+  const out = [];
+  msgs.forEach((m) => {
+    if (m.role === 'user') {
+      out.push({ role: 'user', content: m.content });
+    } else if (m.role === 'assistant') {
+      (m.tool_calls || []).forEach((tc) => {
+        toolNameById[tc.id] = tc.function?.name;
+      });
+      if (m.content) out.push({ role: 'assistant', content: m.content });
+    } else if (m.role === 'tool') {
+      let result = null;
+      try { result = JSON.parse(m.content); } catch { result = null; }
+      out.push({
+        role: 'tool',
+        toolName: toolNameById[m.tool_call_id] || '工具调用',
+        toolArgs: {},
+        toolResult: result,
+      });
+    }
+  });
+  return out;
+};
+
+/**
  * AI 文件助手（首页主体，全站唯一的文件搜索入口）
  * 找文件直接在对话里描述内容即可；助手同时负责文件管理操作与危险操作确认。
+ * 对话历史持久化在服务端（MySQL），左侧栏可查看/恢复/删除历史会话。
  */
 export default function AssistantChat() {
   const { user, logout } = useAuth();
@@ -159,12 +238,71 @@ export default function AssistantChat() {
   const [thinking, setThinking] = useState(false);
   const [currentConvId, setCurrentConvId] = useState(null);
   const [confirmData, setConfirmData] = useState(null);
+  const [convs, setConvs] = useState([]);
   const abortRef = useRef(null);
   const endRef = useRef(null);
 
   useEffect(() => { endRef.current?.scrollIntoView({ behavior: 'smooth' }); }, [messages, thinking]);
 
   const addMsg = useCallback((msg) => setMessages((p) => [...p, msg]), []);
+
+  // 关闭"还在打字"的 AI 气泡：此后再来的 message 增量新开一条，而不是接着追加。
+  // 收到 tool_call/confirm/done 等非文本事件时调用（隐式封笔）
+  const closeStreamingBubble = useCallback(() => {
+    setMessages((p) => {
+      const last = p[p.length - 1];
+      if (last && last.role === 'assistant' && last.streaming) {
+        const cp = [...p];
+        cp[cp.length - 1] = { ...last, streaming: false };
+        return cp;
+      }
+      return p;
+    });
+  }, []);
+
+  // ── 历史会话 ──
+  const refreshConvs = useCallback(async () => {
+    try {
+      const { conversations } = await listConversations(user);
+      setConvs(conversations);
+    } catch (err) {
+      if (err.tokenExpired) logout();
+    }
+  }, [user, logout]);
+
+  useEffect(() => { refreshConvs(); }, [refreshConvs]);
+
+  const handleOpenConv = useCallback(async (convId) => {
+    if (streaming || convId === currentConvId) return;
+    abortRef.current?.abort();
+    try {
+      const { messages: stored } = await fetchConversationMessages(user, convId);
+      setMessages(mapHistoryMessages(stored));
+      setCurrentConvId(convId);
+      setThinking(false);
+      setConfirmData(null);
+    } catch (err) {
+      if (err.tokenExpired) logout();
+    }
+  }, [streaming, currentConvId, user, logout]);
+
+  const handleDeleteConv = useCallback(async (convId) => {
+    try {
+      await deleteConversation(user, convId);
+      if (convId === currentConvId) {
+        // 删的是当前会话：回到新对话状态
+        abortRef.current?.abort();
+        setMessages([]);
+        setCurrentConvId(null);
+        setStreaming(false);
+        setThinking(false);
+        setConfirmData(null);
+      }
+      refreshConvs();
+    } catch (err) {
+      if (err.tokenExpired) logout();
+    }
+  }, [user, currentConvId, refreshConvs, logout]);
 
   const handleSend = useCallback(async () => {
     const text = input.trim();
@@ -178,6 +316,7 @@ export default function AssistantChat() {
       onThinking: () => setThinking(true),
       onToolCall: (d) => {
         setThinking(false);
+        closeStreamingBubble();
         addMsg({ role: 'tool', toolName: d.name, toolArgs: d.arguments });
       },
       onToolResult: (d) => {
@@ -192,27 +331,62 @@ export default function AssistantChat() {
           return cp;
         });
       },
+      // 逐 token 增量：末尾是"还在打字"的 AI 气泡就追加，否则新开一条
       onMessage: (d) => {
         setThinking(false);
-        addMsg({ role: 'assistant', content: d.delta });
+        setMessages((p) => {
+          const last = p[p.length - 1];
+          if (last && last.role === 'assistant' && last.streaming) {
+            const cp = [...p];
+            cp[cp.length - 1] = { ...last, content: last.content + d.delta };
+            return cp;
+          }
+          return [...p, { role: 'assistant', content: d.delta, streaming: true }];
+        });
+      },
+      // 收尾修正（下载链接重签）：整体替换最后一条 AI 气泡
+      onMessageReplace: (d) => {
+        setMessages((p) => {
+          const last = p[p.length - 1];
+          if (last && last.role === 'assistant') {
+            const cp = [...p];
+            cp[cp.length - 1] = { ...last, content: d.content, streaming: false };
+            return cp;
+          }
+          return [...p, { role: 'assistant', content: d.content, streaming: false }];
+        });
       },
       onConfirmRequired: (d) => {
         setThinking(false);
+        closeStreamingBubble();
         setConfirmData(d);
       },
       onError: (err) => {
         setThinking(false);
         setStreaming(false);
+        closeStreamingBubble();
         if (err.tokenExpired) logout();
         else addMsg({ role: 'system', content: `出错了：${err.message}` });
       },
       onDone: (d) => {
         setThinking(false);
         setStreaming(false);
+        closeStreamingBubble();
         if (d.conv_id) setCurrentConvId(d.conv_id);
+        refreshConvs();  // 新会话入库/标题更新后刷新侧栏排序
       },
     });
-  }, [input, streaming, currentConvId, user, addMsg, logout]);
+  }, [input, streaming, currentConvId, user, addMsg, closeStreamingBubble, logout, refreshConvs]);
+
+  // 停止生成：掐断连接（后端会把已生成的部分落库），界面立即恢复可输入
+  const handleStop = useCallback(() => {
+    abortRef.current?.abort();
+    closeStreamingBubble();
+    setStreaming(false);
+    setThinking(false);
+    // 稍等后台存档完成再刷新侧栏，让半截回答反映到会话排序里
+    setTimeout(() => refreshConvs(), 800);
+  }, [closeStreamingBubble, refreshConvs]);
 
   const handleConfirm = useCallback(async (token, decision) => {
     setConfirmData(null);
@@ -287,8 +461,50 @@ export default function AssistantChat() {
         </Tooltip>
       </div>
 
-      <MsgList>
-        {messages.length === 0 && !thinking && (
+      <ChatLayout>
+        <ConvSidebar>
+          {convs.length === 0 && (
+            <Text type="secondary" style={{ fontSize: 12, textAlign: 'center', padding: '12px 0' }}>
+              暂无历史会话
+            </Text>
+          )}
+          {convs.map((c) => (
+            <ConvItem
+              key={c.conv_id}
+              $active={c.conv_id === currentConvId}
+              onClick={() => handleOpenConv(c.conv_id)}
+            >
+              <div style={{ flex: 1, minWidth: 0 }}>
+                <div style={{ fontSize: 13, fontWeight: 500, whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis' }}>
+                  {c.title}
+                </div>
+                <div style={{ fontSize: 11, color: '#8c95a3', marginTop: 2 }}>
+                  {c.update_time} · {c.user_message_count} 条
+                </div>
+              </div>
+              <Popconfirm
+                title="删除该会话？"
+                description="删除后将从历史列表移除"
+                onConfirm={() => handleDeleteConv(c.conv_id)}
+                okText="删除"
+                cancelText="取消"
+              >
+                <Button
+                  className="del-btn"
+                  type="text"
+                  size="small"
+                  danger
+                  icon={<DeleteOutlined />}
+                  onClick={(e) => e.stopPropagation()}
+                />
+              </Popconfirm>
+            </ConvItem>
+          ))}
+        </ConvSidebar>
+
+        <div style={{ flex: 1, minWidth: 0 }}>
+          <MsgList>
+            {messages.length === 0 && !thinking && (
           <div style={{ marginTop: 48 }}>
             <Empty
               image={Empty.PRESENTED_IMAGE_SIMPLE}
@@ -335,19 +551,31 @@ export default function AssistantChat() {
           style={{ flex: 1 }}
         />
         <div style={{ display: 'flex', alignItems: 'center', gap: 8, marginTop: 8 }}>
-          <Button
-            type="primary"
-            icon={<SendOutlined />}
-            onClick={handleSend}
-            loading={streaming}
-            disabled={!input.trim()}
-            block
-          >
-            发送
-          </Button>
+          {streaming ? (
+            <Button
+              danger
+              icon={<StopOutlined />}
+              onClick={handleStop}
+              block
+            >
+              停止
+            </Button>
+          ) : (
+            <Button
+              type="primary"
+              icon={<SendOutlined />}
+              onClick={handleSend}
+              disabled={!input.trim()}
+              block
+            >
+              发送
+            </Button>
+          )}
         </div>
         <Hint>Enter 发送 · Shift+Enter 换行 · 删除/分享操作会弹窗确认</Hint>
       </InputBar>
+        </div>
+      </ChatLayout>
 
       <ConfirmModal
         open={!!confirmData}

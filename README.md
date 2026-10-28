@@ -78,7 +78,8 @@
 
 ### AI 文件助手
 
-- **对话式交互**：SSE 实时流式输出，支持多轮对话记忆（Redis，1 小时有效期）
+- **对话式交互**：SSE 实时流式输出，多轮上下文（用户消息先落库，连接中断也不丢提问）
+- **历史会话持久化**：会话元数据与全量消息存 MySQL（agent_conversation / agent_message），左侧栏可查看、恢复、删除历史会话；组装 LLM 上下文时按 user 消息边界截断，工具调用对不被切断
 - **7 个工具函数**：search_files、get_file_info、list_recent_files、get_storage_stats、describe_file、delete_file、share_file
 - **三级安全模型**：LLM 自主判断（提示词引导）→ 工具级门控（暂停+确认弹窗）→ 服务端鉴权（校验文件归属）
 - **危险操作确认**：删除/分享操作必须用户在前端弹窗中确认，5 分钟超时自动取消
@@ -226,6 +227,9 @@ tc_nginx   :443/80   Nginx 反向代理
 | `/api/ai/rebuild` | POST | 重建 FAISS 索引 |
 | `/api/agent/chat` | POST | Agent SSE 对话 |
 | `/api/agent/confirm` | POST | 确认危险操作 |
+| `/api/agent/conversations` | POST | 历史会话列表（分页） |
+| `/api/agent/conversations/messages` | POST | 读取会话消息（支持 before_seq 向上翻页） |
+| `/api/agent/conversations/delete` | POST | 软删除会话 |
 
 ## 配置说明
 
