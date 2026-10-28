@@ -13,7 +13,10 @@ FROM nginx:1.26-alpine
 # 前端静态资源落到 nginx.conf 的 root 路径 /app/front
 COPY --from=front-build /app/build /app/front
 
-RUN apk add --no-cache openssl && \
+# 本机/国内网络访问 dl-cdn.alpinelinux.org 会被拒（Permission denied），
+# apk 先切阿里云镜像源再装 openssl，否则自签证书这步构建必挂
+RUN sed -i 's#https://dl-cdn.alpinelinux.org#https://mirrors.aliyun.com#g' /etc/apk/repositories && \
+    apk add --no-cache openssl && \
     mkdir -p /etc/nginx/ssl /var/www/certbot && \
     openssl req -x509 -nodes -days 3650 -newkey rsa:2048 \
       -keyout /etc/nginx/ssl/server.key \
