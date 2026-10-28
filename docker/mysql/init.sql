@@ -84,3 +84,29 @@ CREATE TABLE IF NOT EXISTS user_file_ai_desc (
     UNIQUE KEY uq_user_md5_chunk (user, md5(191), chunk_index),
     KEY idxufad_user (user)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+
+-- Agent 历史会话持久化（MySQL 为唯一真相源，Redis 不再存对话正文）
+CREATE TABLE IF NOT EXISTS agent_conversation (
+    id BIGINT AUTO_INCREMENT PRIMARY KEY,
+    conv_key VARCHAR(36) NOT NULL UNIQUE COMMENT '对外会话标识 uuid4，即前端 conversation_id',
+    user VARCHAR(32) NOT NULL COMMENT '所属用户名',
+    title VARCHAR(200) NOT NULL DEFAULT '新对话',
+    message_count INT NOT NULL DEFAULT 0,
+    last_seq BIGINT NOT NULL DEFAULT 0 COMMENT '会话内最后一条消息的 seq，行锁下递增分配',
+    deleted_at TIMESTAMP NULL COMMENT '软删除时间，NULL 为有效',
+    create_time TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    update_time TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    KEY idx_agent_conv_user (user, update_time, id)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+
+CREATE TABLE IF NOT EXISTS agent_message (
+    id BIGINT AUTO_INCREMENT PRIMARY KEY,
+    conv_id BIGINT NOT NULL COMMENT 'agent_conversation.id',
+    seq BIGINT NOT NULL COMMENT '会话内顺序号，从 1 连续递增',
+    role VARCHAR(20) NOT NULL COMMENT 'user / assistant / tool（system 提示词不落库）',
+    content MEDIUMTEXT COMMENT '文本正文；assistant 发起工具调用时可为空',
+    tool_calls JSON COMMENT 'assistant 消息的工具调用列表（OpenAI tool_calls 结构）',
+    tool_call_id VARCHAR(64) COMMENT 'role=tool 时回指的 tool_call id',
+    create_time TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    UNIQUE KEY uq_agent_msg_conv_seq (conv_id, seq)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;

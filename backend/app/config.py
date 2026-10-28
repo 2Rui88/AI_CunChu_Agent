@@ -66,7 +66,7 @@ class Settings(BaseSettings):
     faiss_user_index_dir: str = "/data/faiss/users"
 
     # ── Agent ──
-    conversation_ttl_seconds: int = 3600
+    # 对话历史已落 MySQL（agent_conversation/agent_message），不再有 Redis TTL
     max_context_messages: int = 20
     max_tool_calls_per_turn: int = 5
 
