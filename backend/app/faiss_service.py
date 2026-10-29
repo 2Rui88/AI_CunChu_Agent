@@ -61,15 +61,20 @@ def save_index(username: str, index: faiss.IndexFlatIP):
 
 def add_vector(username: str, vec: np.ndarray) -> int:
     """
-    向用户索引中追加一个向量，返回分配的 faiss_id（添加前的 ntotal）。
+    向用户索引中追加一个向量，返回分配的 faiss_id（添加前的 ntotal）；
+    锁被重建等长操作占用时返回 -1（非阻塞抢锁，不排队等）。
     整个"读盘→追加→写盘"持用户级文件锁执行：gunicorn 多 worker 并发写入时
     串行化，防止两个请求读到相同 ntotal 而分配重复 faiss_id、相互覆盖。
     向量添加前先做 L2 归一化，添加后自动保存索引到磁盘。
+
+    返回 -1 时调用方应跳过 faiss_id 回写并 mark_dirty(user)，让下次
+    搜索前的自动重建把该向量补进索引——重建与增量写入抢同一把锁，
+    排队等待会长期占住线程池线程，让位给重建更划算。
     """
     vec = l2_normalize(vec)
-    lock_fd = acquire_lock(username)
+    lock_fd = acquire_lock(username, blocking=False)
     if lock_fd < 0:
-        raise RuntimeError("faiss index lock busy")
+        return -1
     try:
         idx = load_index(username)
         faiss_id = int(idx.ntotal)
@@ -108,21 +113,29 @@ def search(
     return results
 
 
+def rebuild_locked(username: str, vectors: list[np.ndarray]):
+    """
+    用给定向量整体替换用户索引。调用方必须已持有该用户的文件锁
+    （acquire_lock 成功返回后调用），否则与 add_vector 失去互斥。
+    """
+    idx = faiss.IndexFlatIP(settings.embedding_dimension)
+    for vec in vectors:
+        v = l2_normalize(vec.copy()).reshape(1, -1).astype(np.float32)
+        idx.add(v)
+    save_index(username, idx)
+
+
 def rebuild_from_db(username: str, vectors: list[np.ndarray]):
     """
     从数据库中的向量列表全量重建用户索引（用于 rebuild 场景）。
-    持文件锁执行，与 add_vector 互斥（锁不可重入，调用方不得已持锁）。
+    阻塞式持文件锁执行，与 add_vector 互斥（锁不可重入，调用方不得已持锁）。
     清空现有索引，批量添加后保存。
     """
     lock_fd = acquire_lock(username)
     if lock_fd < 0:
-        raise RuntimeError("faiss index lock busy")
+        raise RuntimeError("faiss index lock unavailable")
     try:
-        idx = faiss.IndexFlatIP(settings.embedding_dimension)
-        for vec in vectors:
-            v = l2_normalize(vec.copy()).reshape(1, -1).astype(np.float32)
-            idx.add(v)
-        save_index(username, idx)
+        rebuild_locked(username, vectors)
     finally:
         release_lock(lock_fd)
 
@@ -180,20 +193,43 @@ def clear_dirty(username: str):
         os.remove(path)
 
 
-def acquire_lock(username: str) -> int:
+def clear_dirty_if_older(username: str, started_at: float):
     """
-    获取文件锁（排他锁），返回文件描述符。
-    用于防止并发 search/rebuild 同时操作同一用户的索引。
-    返回 -1 表示加锁失败。
+    只清除"重建开始之前"设置的脏标记。
+
+    重建期间并发删除/force 重建会再次 mark_dirty（dirty 文件 mtime 更新为
+    新时刻）；无条件 clear_dirty 会把它一并清掉，导致该次删除的幽灵向量
+    常驻索引。按 mtime 比较：早于 started_at 的标记属于本次重建覆盖的
+    快照，可清；晚于它的标记是重建期间新产生的，保留待下次重建。
+    """
+    path = _dirty_path(username)
+    try:
+        if os.path.getmtime(path) <= started_at:
+            os.remove(path)
+    except OSError:
+        pass  # 标记不存在（已被并发清除）或 stat 失败，均视为已清
+
+
+def acquire_lock(username: str, blocking: bool = True) -> int:
+    """
+    获取文件锁（排他锁），返回文件描述符；失败返回 -1。
+    用于防止并发 add_vector/rebuild 同时操作同一用户的索引。
+    blocking=False 时锁被占用立即返回 -1（add_vector 用，避免排队
+    长期占住线程池线程）；blocking=True 时阻塞等待（rebuild 用）。
     """
     os.makedirs(LOCK_DIR, exist_ok=True)
     path = _lock_path(username)
     try:
         fd = os.open(path, os.O_CREAT | os.O_RDWR, 0o644)
-        fcntl.flock(fd, fcntl.LOCK_EX)
-        return fd
     except OSError:
         return -1
+    try:
+        flags = fcntl.LOCK_EX if blocking else fcntl.LOCK_EX | fcntl.LOCK_NB
+        fcntl.flock(fd, flags)
+    except OSError:
+        os.close(fd)  # 抢锁失败也要关掉已打开的 fd，否则每次锁忙泄漏一个描述符
+        return -1
+    return fd
 
 
 def release_lock(fd: int):

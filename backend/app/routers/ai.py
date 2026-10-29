@@ -12,8 +12,10 @@ rebuild:  从 MySQL 全量重建用户 FAISS 索引
 """
 import io
 import re
+import time
 import html
 import asyncio
+import logging
 import zipfile
 import fitz  # PyMuPDF
 import openpyxl
@@ -31,12 +33,15 @@ from app.dashscope_client import describe_image, get_embedding, create_client
 from app.faiss_service import (
     search as faiss_search,
     add_vector,
-    rebuild_from_db,
+    rebuild_locked,
     l2_normalize,
     get_ntotal,
     load_index,
-    is_dirty, clear_dirty, mark_dirty,
+    is_dirty, clear_dirty_if_older, mark_dirty,
+    acquire_lock, release_lock,
 )
+
+logger = logging.getLogger("uvicorn.error")
 
 router = APIRouter(prefix="/api", tags=["ai"])
 
@@ -246,8 +251,14 @@ async def ai_describe(body: dict):
         # execute(text UPDATE) 不会触发 autoflush，否则回写 faiss_id 会因行不存在而静默丢失
         try:
             await db.flush()
+            busy = False
             for i, ch in enumerate(chunks):
                 faiss_id = await asyncio.to_thread(add_vector, user, vecs[i])
+                if faiss_id < 0:
+                    # 锁被重建占用（add_vector 非阻塞抢锁）：跳过回写保持 faiss_id=-1，
+                    # 标脏让下次搜索前重建把该向量补进索引
+                    busy = True
+                    continue
                 await db.execute(
                     text(
                         "UPDATE user_file_ai_desc SET faiss_id = :fid "
@@ -256,7 +267,15 @@ async def ai_describe(body: dict):
                     {"fid": faiss_id, "user": user, "md5": md5_val, "cidx": ch.index},
                 )
             await db.commit()
+            if busy:
+                mark_dirty(user)
         except Exception:
+            # 部分 add_vector 已入索引但回写/commit 失败：DB 回滚后索引里残留
+            # 无 DB 行对应的向量，标脏让下次搜索前重建收敛，而不是留幽灵向量
+            try:
+                mark_dirty(user)
+            except Exception:
+                pass
             return {"code": 1, "msg": "faiss write failed"}
 
     # 强制重建后分块集合已变化：标记索引脏，下次搜索前自动按新记录重建
@@ -610,13 +629,17 @@ async def _copy_cache_to_user(db, user: str, md5_val: str, caches: list) -> dict
         # 同 ai_describe：先 flush 落库，UPDATE 的 faiss_id 回写才能匹配到行
         await db.flush()
         faiss_id = await asyncio.to_thread(add_vector, user, vec)
-        await db.execute(
-            text(
-                "UPDATE user_file_ai_desc SET faiss_id = :fid "
-                "WHERE user = :user AND md5 = :md5 AND chunk_index = :cidx"
-            ),
-            {"fid": faiss_id, "user": user, "md5": md5_val, "cidx": cidx},
-        )
+        if faiss_id < 0:
+            # 锁被重建占用：不回写 faiss_id（保持 -1），标脏待下次搜索前重建补齐
+            mark_dirty(user)
+        else:
+            await db.execute(
+                text(
+                    "UPDATE user_file_ai_desc SET faiss_id = :fid "
+                    "WHERE user = :user AND md5 = :md5 AND chunk_index = :cidx"
+                ),
+                {"fid": faiss_id, "user": user, "md5": md5_val, "cidx": cidx},
+            )
 
     await db.commit()
     return {"code": 0, "msg": "ok"}
@@ -673,40 +696,59 @@ async def _upsert_user_ai_desc(db, user: str, md5_val: str, description: str,
         ))
 
 
-async def _auto_rebuild_if_dirty(user: str):
+async def _rebuild_user_index(user: str) -> int:
     """
-    脏标记检测 + 自动重建 FAISS 索引。
-    文件删除后，dealfile 端点会创建 .dirty 文件，搜索前此处自动重建。
-    注意：文件锁在 rebuild_from_db 内部获取（与 add_vector 互斥），
-    此处不再外层加锁——flock 跨 fd 不可重入，外层持锁再进 rebuild 会死锁。
-    并发触发时最多重复一次幂等重建（数据源相同），不会写坏索引。
+    全量重建用户 FAISS 索引（持锁快照 → 整体替换 → 回写 faiss_id），返回向量数。
+
+    关键：DB 快照在持锁之后才读取。快照在锁外读的话，select 与 rebuild 之间
+    并发 ai_describe 完成 add_vector（基于旧索引分配 id=k 写回 DB），重建随后
+    用不含该行的快照整体替换索引——新向量丢失且 faiss_id=k 指向别的 chunk。
+    持锁后 add_vector 无法插入（非阻塞抢锁必失败并 mark_dirty），快照因此
+    与索引替换之间无并发写入。
     """
-    if not is_dirty(user):
-        return
+    lock_fd = await asyncio.to_thread(acquire_lock, user)  # 阻塞等待，排队串行重建
+    if lock_fd < 0:
+        raise RuntimeError("faiss index lock unavailable")
+    try:
+        async with Session() as db:
+            result = await db.execute(
+                select(UserFileAiDesc).where(
+                    UserFileAiDesc.user == user,
+                    UserFileAiDesc.status == 1,
+                    UserFileAiDesc.embedding.isnot(None),
+                ).order_by(UserFileAiDesc.id)
+            )
+            rows = result.scalars().all()
 
-    async with Session() as db:
-        result = await db.execute(
-            select(UserFileAiDesc).where(
-                UserFileAiDesc.user == user,
-                UserFileAiDesc.status == 1,
-                UserFileAiDesc.embedding.isnot(None),
-            ).order_by(UserFileAiDesc.id)
-        )
-        rows = result.scalars().all()
-
-        if not rows:
-            await asyncio.to_thread(rebuild_from_db, user, [])
-        else:
             vectors = [np.frombuffer(r.embedding, dtype=np.float32) for r in rows]
-            await asyncio.to_thread(rebuild_from_db, user, vectors)
-            # 回写 faiss_id
+            await asyncio.to_thread(rebuild_locked, user, vectors)
+
+            # 回写 faiss_id（重建后 id 从 0 重新分配）
             idx = await asyncio.to_thread(load_index, user)
             for i, r in enumerate(rows):
                 if i < idx.ntotal:
                     r.faiss_id = i
             await db.commit()
+            return len(rows)
+    finally:
+        release_lock(lock_fd)
 
-    clear_dirty(user)
+
+async def _auto_rebuild_if_dirty(user: str):
+    """
+    脏标记检测 + 自动重建 FAISS 索引。
+    文件删除后，dealfile 端点会创建 .dirty 文件，搜索前此处自动重建。
+    锁在 _rebuild_user_index 内部获取（与 add_vector 互斥），此处不持锁调用。
+    并发触发时最多重复一次幂等重建（数据源相同），不会写坏索引。
+    """
+    if not is_dirty(user):
+        return
+
+    started_at = time.time()
+    await _rebuild_user_index(user)
+    # 只清"重建开始前"的脏标记：重建期间并发 mark_dirty 的新标记保留，
+    # 否则该次删除的幽灵向量要等到下一次删除才被清理
+    await asyncio.to_thread(clear_dirty_if_older, user, started_at)
 
 
 # ═══════════════════════════════════════════════════════════
@@ -960,46 +1002,56 @@ async def semantic_search(user: str, query: str, top_k: int = 10,
         try:
             await _auto_rebuild_if_dirty(user)
         except Exception:
+            logger.exception("搜索前自动重建索引失败，用现存索引继续")
             pass  # 重建失败不影响搜索，用现存索引继续
 
-    if await asyncio.to_thread(get_ntotal, user) == 0:
-        return {"code": 0, "count": 0, "files": []}
-
-    # ── 查询预处理：特征检测 → 分类 → 改写 ──
-    features = _detect_query_features(query)
-
-    # 结构特征未命中时用 LLM 二次分类
-    if not features["is_precise"]:
-        qtype = await _classify_query(query, api_key)
-    else:
-        qtype = "精确"
-
-    # 模糊查询 → 改写 + 均值向量；精确查询 → 原始 embedding
-    if qtype == "模糊":
-        query_vec = await _rewrite_and_embed(query, api_key)
-    else:
-        try:
-            embedding = await get_embedding(api_key, query)
-        except RuntimeError as exc:
-            return {"code": 1, "msg": f"embedding failed: {exc}"}
-        query_vec = np.array(embedding, dtype=np.float32)
-    try:
-        results = await asyncio.to_thread(faiss_search, user, query_vec, top_k)
-    except Exception as exc:
-        return {"code": 1, "msg": f"faiss search failed: {exc}"}
-
-    # ── 关键词路（门控：无精确词则跳过）──
     keywords = _extract_keywords(query)
+    index_ready = await asyncio.to_thread(get_ntotal, user) > 0
+
+    # ── 向量路（索引为空时整体跳过：无向量可搜，也省掉 embedding 调用）──
+    results: list[tuple[int, float]] = []
+    if index_ready:
+        # ── 查询预处理：特征检测 → 分类 → 改写 ──
+        features = _detect_query_features(query)
+
+        # 结构特征未命中时用 LLM 二次分类
+        if not features["is_precise"]:
+            qtype = await _classify_query(query, api_key)
+        else:
+            qtype = "精确"
+
+        # 模糊查询 → 改写 + 均值向量；精确查询 → 原始 embedding
+        if qtype == "模糊":
+            query_vec = await _rewrite_and_embed(query, api_key)
+        else:
+            try:
+                embedding = await get_embedding(api_key, query)
+            except RuntimeError as exc:
+                return {"code": 1, "msg": f"embedding failed: {exc}"}
+            query_vec = np.array(embedding, dtype=np.float32)
+        try:
+            results = await asyncio.to_thread(faiss_search, user, query_vec, top_k)
+        except Exception as exc:
+            return {"code": 1, "msg": f"faiss search failed: {exc}"}
+
+    # ── 关键词路 ──
+    # 常规门控：有扩展名/日期/编号等精确锚点才跑。但向量路不可用时
+    # （索引为空：新用户、或尚未对任何文件建立 AI 描述），关键词路是
+    # 唯一可用路径——必须兜底，否则按文件名精确搜索也返回"没有找到"。
+    if not keywords and not index_ready:
+        fallback_kw = query.strip()[:64]
+        if fallback_kw:
+            keywords = [fallback_kw]
     kw_files = await _keyword_search(user, keywords, query=query, limit=top_k) if keywords else []
 
     # ── faiss_id → MySQL 联表查询（向量路，含 context_label）──
-    async with Session() as db:
-        vec_ranked: dict[str, dict] = {}  # md5 → {file info, rank, vector_score}
-
-        for rank_i, (faiss_id, score) in enumerate(results):
-            if score < SCORE_THRESHOLD:
-                continue
-            result = await db.execute(
+    # 一次 IN 批量回查（替代逐 id 单查的 N+1），结果取齐即退出会话——
+    # 后续 RRF 融合与 LLM 重排是纯内存/纯网络操作，不应占着连接池连接
+    vec_ranked: dict[str, dict] = {}  # md5 → {file info, rank, vector_score}
+    valid = [(fid, score) for fid, score in results if score >= SCORE_THRESHOLD]
+    if valid:
+        async with Session() as db:
+            db_rows = (await db.execute(
                 select(UserFileAiDesc, UserFileList, FileInfo)
                 .join(UserFileList,
                       (UserFileList.user == UserFileAiDesc.user) &
@@ -1007,12 +1059,19 @@ async def semantic_search(user: str, query: str, top_k: int = 10,
                 .join(FileInfo, FileInfo.md5 == UserFileAiDesc.md5)
                 .where(
                     UserFileAiDesc.user == user,
-                    UserFileAiDesc.faiss_id == faiss_id,
+                    UserFileAiDesc.faiss_id.in_([fid for fid, _ in valid]),
                     UserFileAiDesc.status == 1,
-                ).limit(1)
-            )
-            row = result.first()
-            if row:
+                )
+            )).all()
+            by_fid = {uad.faiss_id: (uad, ufl, fi) for uad, ufl, fi in db_rows}
+
+            # 只有通过阈值的结果占用名次——被跳过项继续计数会稀释后续项的 RRF 排名
+            rank = 0
+            for fid, score in valid:
+                row = by_fid.get(fid)
+                if not row:
+                    continue
+                rank += 1
                 uad, ufl, fi = row
                 md5 = uad.md5
                 # 同 md5 多 chunk 命中：保留最高分的那个
@@ -1023,53 +1082,53 @@ async def semantic_search(user: str, query: str, top_k: int = 10,
                         "description": uad.description,
                         "url": presign_from_db_url(fi.url), "size": str(fi.size), "type": fi.type,
                         "score": round(score, 4),
-                        "rank": rank_i + 1,
+                        "rank": rank,
                         "match_context": uad.context_label or "",
                         "chunk_index": uad.chunk_index,
                     }
 
-        # ── RRF 双路排名融合 ──
-        K = 60
-        rrf_scores: dict[str, float] = {}
-        file_map: dict[str, dict] = {}
+    # ── RRF 双路排名融合（纯内存计算，无 DB 会话）──
+    K = 60
+    rrf_scores: dict[str, float] = {}
+    file_map: dict[str, dict] = {}
 
-        # 向量路贡献
-        for md5, info in vec_ranked.items():
-            rrf_scores[md5] = 1.0 / (K + info["rank"])
-            info["source"] = "向量路"
-            file_map[md5] = info
+    # 向量路贡献
+    for md5, info in vec_ranked.items():
+        rrf_scores[md5] = 1.0 / (K + info["rank"])
+        info["source"] = "向量路"
+        file_map[md5] = info
 
-        # 关键词路贡献
-        for rank_j, kf in enumerate(kw_files):
-            md5 = kf["md5"]
-            kw_rrf = 1.0 / (K + rank_j + 1)
-            if md5 in rrf_scores:
-                rrf_scores[md5] += kw_rrf
-                file_map[md5]["source"] = "双路混合"
-            else:
-                rrf_scores[md5] = kw_rrf
-                kf["rank"] = rank_j + 1
-                kf["match_context"] = ""
-                kf["source"] = "关键词路"
-                kf["score"] = 0.0
-                file_map[md5] = kf
+    # 关键词路贡献
+    for rank_j, kf in enumerate(kw_files):
+        md5 = kf["md5"]
+        kw_rrf = 1.0 / (K + rank_j + 1)
+        if md5 in rrf_scores:
+            rrf_scores[md5] += kw_rrf
+            file_map[md5]["source"] = "双路混合"
+        else:
+            rrf_scores[md5] = kw_rrf
+            kf["rank"] = rank_j + 1
+            kf["match_context"] = ""
+            kf["source"] = "关键词路"
+            kf["score"] = 0.0
+            file_map[md5] = kf
 
-        # RRF 降序排列
-        sorted_md5s = sorted(rrf_scores, key=lambda m: rrf_scores[m], reverse=True)
-        files = []
-        for md5 in sorted_md5s:
-            f = file_map[md5]
-            f["rrf_score"] = round(rrf_scores[md5], 5)
-            files.append(f)
+    # RRF 降序排列
+    sorted_md5s = sorted(rrf_scores, key=lambda m: rrf_scores[m], reverse=True)
+    files = []
+    for md5 in sorted_md5s:
+        f = file_map[md5]
+        f["rrf_score"] = round(rrf_scores[md5], 5)
+        files.append(f)
 
-        # ── LLM 重排序（Top-20 → Top-10）──
-        if len(files) > 1 and api_key:
-            try:
-                files = await _rerank_with_llm(query, files[:20], api_key)
-            except Exception:
-                pass  # 失败降级：保留 RRF 排名
+    # ── LLM 重排序（Top-20 → Top-10；秒级 LLM 调用，务必在 DB 会话之外）──
+    if len(files) > 1 and api_key:
+        try:
+            files = await _rerank_with_llm(query, files[:20], api_key)
+        except Exception:
+            pass  # 失败降级：保留 RRF 排名
 
-        return {"code": 0, "count": len(files), "files": files}
+    return {"code": 0, "count": len(files), "files": files}
 
 
 # ============================================================
@@ -1087,30 +1146,14 @@ async def ai_rebuild(body: dict):
     if not await check_token(user, token):
         return {"code": 4}
 
-    async with Session() as db:
-        result = await db.execute(
-            select(UserFileAiDesc).where(
-                UserFileAiDesc.user == user,
-                UserFileAiDesc.status == 1,
-                UserFileAiDesc.embedding.isnot(None),
-            ).order_by(UserFileAiDesc.id)
-        )
-        rows = result.scalars().all()
+    try:
+        started_at = time.time()
+        count = await _rebuild_user_index(user)
+    except Exception as exc:
+        return {"code": 1, "msg": f"faiss rebuild failed: {exc}"}
 
-        if not rows:
-            return {"code": 0, "msg": "rebuilt", "count": 0}
+    # 手动重建成功后清掉残留脏标记（按 mtime 只清重建开始前的），
+    # 否则下次搜索会再做一次冗余的自动重建
+    await asyncio.to_thread(clear_dirty_if_older, user, started_at)
 
-        vectors = [np.frombuffer(r.embedding, dtype=np.float32) for r in rows]
-        try:
-            await asyncio.to_thread(rebuild_from_db, user, vectors)
-        except Exception as exc:
-            return {"code": 1, "msg": f"faiss rebuild failed: {exc}"}
-
-        # 更新 faiss_id（重建后 id 从 0 重新分配）
-        idx = await asyncio.to_thread(load_index, user)
-        for i, r in enumerate(rows):
-            if i < idx.ntotal:
-                r.faiss_id = i
-        await db.commit()
-
-    return {"code": 0, "msg": "rebuilt", "count": len(vectors)}
+    return {"code": 0, "msg": "rebuilt", "count": count}
