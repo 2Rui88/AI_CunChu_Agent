@@ -3,10 +3,12 @@
 
 流程: chunk_init → chunk_upload (循环) → chunk_merge
 Redis Key: chunk:<user>:<md5> Hash 存储分片元信息（按用户隔离）
-临时目录: /tmp/chunks/<用户名哈希>/<md5>/ 存储分片数据
+临时目录: /data/chunks/<用户名哈希>/<md5>/ 存储分片数据
 """
 import os
 import re
+import time
+import shutil
 import asyncio
 import hashlib
 from urllib.parse import parse_qs
@@ -24,11 +26,31 @@ router = APIRouter(prefix="/api", tags=["chunk"])
 # 挂载在 docker 卷（chunk_data:/data/chunks）上，容器重启后分片仍可用于断点续传
 CHUNK_TEMP_DIR = "/data/chunks"
 
+# 与 Redis 任务 TTL 对齐：超过该时长没动静的分片目录必然已无任务元数据
+# （merge 不可能成功），属可回收垃圾
+CHUNK_STALE_SECONDS = 86400
+
 # 合法 md5 为 32 位十六进制；同时杜绝 "../" 之类的路径穿越
 _MD5_RE = re.compile(r"^[0-9a-fA-F]{32}$")
 _MAX_CHUNK_COUNT = 1000000
 # 单个分片大小上限：前端 CHUNK_SIZE(10MB) + 传输余量，防止匿名灌盘
 _MAX_CHUNK_BODY = 12 * 1024 * 1024
+
+# 原子地把分片序号追加进 uploaded 列表（HGET→拼接→HSET 的读改写竞态会让
+# 后写覆盖先写：某分片文件已在盘但列表缺失，merge 误报不完整）
+_ADD_UPLOADED_LUA = """
+local cur = redis.call('HGET', KEYS[1], 'uploaded') or ''
+local idx = ARGV[1]
+if cur == '' then
+  redis.call('HSET', KEYS[1], 'uploaded', idx)
+  return 1
+end
+for p in string.gmatch(cur, '[^,]+') do
+  if p == idx then return 0 end
+end
+redis.call('HSET', KEYS[1], 'uploaded', cur .. ',' .. idx)
+return 1
+"""
 
 
 def _is_valid_md5(value: str) -> bool:
@@ -44,6 +66,32 @@ def _chunk_dir(user: str, md5_val: str) -> str:
     """分片临时目录（按用户隔离；用户名哈希后拼路径，杜绝特殊字符进入路径）"""
     user_dir = hashlib.md5(user.encode()).hexdigest()
     return os.path.join(CHUNK_TEMP_DIR, user_dir, md5_val)
+
+
+def _cleanup_stale_chunks(user: str):
+    """删除该用户超过 TTL 仍残留的分片目录/临时合并文件。
+
+    Redis 任务 24h 过期只清元数据，分片文件此前无任何清理路径——
+    放弃的上传会永久占用 chunk_data 卷。挂在该用户 chunk_init 时惰性执行，
+    只动自己的目录，多 worker 并发触发时重复删除被 ignore_errors 吸收。
+    目录 mtime 在写入分片时更新，活跃上传不会被误删。
+    """
+    root = os.path.join(CHUNK_TEMP_DIR, hashlib.md5(user.encode()).hexdigest())
+    cutoff = time.time() - CHUNK_STALE_SECONDS
+    try:
+        for name in os.listdir(root):
+            path = os.path.join(root, name)
+            try:
+                if os.path.getmtime(path) >= cutoff:
+                    continue
+                if os.path.isdir(path):
+                    shutil.rmtree(path, ignore_errors=True)
+                else:
+                    os.remove(path)  # 残留的 *_merged 临时文件
+            except OSError:
+                continue
+    except OSError:
+        pass  # 用户目录不存在 = 无垃圾可清
 
 
 def _merge_chunk_files(chunk_dir: str, chunk_count: int, merged_path: str):
@@ -93,6 +141,9 @@ async def chunk_init(body: dict):
 
     redis_key = _chunk_task_key(user, file_md5)
 
+    # 惰性清理该用户超过 TTL 的废弃分片（磁盘 IO 挪线程池）
+    await asyncio.to_thread(_cleanup_stale_chunks, user)
+
     # 检查是否已存在分片任务（断点续传）
     exists = await redis.exists(redis_key)
     if exists:
@@ -123,11 +174,13 @@ async def chunk_upload(request: Request):
     分片上传 —— 接收单个分片的二进制数据，保存到本地临时目录。
     必须携带 user + token（且与任务发起人一致），限制单片大小，
     防止未授权写入与他人恶意污染/灌盘。
+    user/token 优先读请求头（避免 token 进 URL 查询串被访问日志留存），
+    兼容旧客户端的查询串传法。
     """
     qs = parse_qs(request.url.query)
     md5_val = (qs.get("md5") or [""])[0]
-    user = (qs.get("user") or [""])[0]
-    token = (qs.get("token") or [""])[0]
+    user = request.headers.get("x-upload-user") or (qs.get("user") or [""])[0]
+    token = request.headers.get("x-upload-token") or (qs.get("token") or [""])[0]
     idx_raw = (qs.get("index") or [""])[0]
 
     # 只接受 32 位十六进制 md5，防止路径穿越写任意路径
@@ -144,9 +197,13 @@ async def chunk_upload(request: Request):
     if not await check_token(user, token):
         return {"code": 4}
     redis_key = _chunk_task_key(user, md5_val)
-    task_owner = await redis.hget(redis_key, "user")
-    if not task_owner or task_owner != user:
+    chunk_count_raw = await redis.hget(redis_key, "chunk_count")
+    if not chunk_count_raw:
         return {"code": 1, "msg": "chunk task not found"}
+    # 分片序号必须落在任务声明的 chunk_count 之内：否则伪分片能把 uploaded
+    # 列表长度凑够 chunk_count，骗过完整性检查后 merge 打开不存在的文件
+    if idx >= int(chunk_count_raw):
+        return {"code": 1, "msg": "invalid index"}
 
     # 单片大小限制：先看声明长度（提前拒绝），再校验实际 body
     declared = request.headers.get("content-length")
@@ -168,12 +225,8 @@ async def chunk_upload(request: Request):
     with open(chunk_path, "wb") as f:
         f.write(body)
 
-    # 更新 Redis 中已上传分片列表
-    uploaded = await redis.hget(redis_key, "uploaded") or ""
-    uploaded_list = [x for x in uploaded.split(",") if x]
-    if str(idx) not in uploaded_list:
-        uploaded_list.append(str(idx))
-    await redis.hset(redis_key, "uploaded", ",".join(uploaded_list))
+    # 原子更新 Redis 中已上传分片列表（Lua，防并发读改写覆盖）
+    await redis.eval(_ADD_UPLOADED_LUA, 1, redis_key, str(idx))
 
     return {"code": 0}
 
