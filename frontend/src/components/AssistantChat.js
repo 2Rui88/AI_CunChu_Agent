@@ -1,5 +1,5 @@
 import React, { useState, useRef, useEffect, useCallback } from 'react';
-import { Card, Input, Button, Avatar, Tooltip, Typography, Spin, Empty, Tag, Popconfirm } from 'antd';
+import { Card, Input, Button, Avatar, Tooltip, Typography, Spin, Empty, Tag, Popconfirm, message } from 'antd';
 import {
   SendOutlined, PlusOutlined, RobotOutlined, ToolOutlined, DeleteOutlined, StopOutlined,
 } from '@ant-design/icons';
@@ -11,6 +11,9 @@ import {
 import { useAuth } from '../contexts/AuthContext';
 
 const { Text } = Typography;
+
+// 流式增量合并刷渲染的间隔：逐 token setState 是 O(消息数×token 数) 的重渲染
+const STREAM_FLUSH_MS = 100;
 
 const MsgList = styled.div`
   height: 520px;
@@ -199,18 +202,19 @@ function renderRich(content) {
  * 服务端消息 → 聊天视图模型。
  * 库里的 assistant 消息可能只带 tool_calls（无正文），不直接渲染；
  * 工具名由其 tool_calls 的 id→name 映射回填到后续 tool 消息上。
+ * 保留 seq 供"加载更早消息"翻页（before_seq 取首条消息的 seq）。
  */
 const mapHistoryMessages = (msgs) => {
   const toolNameById = {};
   const out = [];
   msgs.forEach((m) => {
     if (m.role === 'user') {
-      out.push({ role: 'user', content: m.content });
+      out.push({ role: 'user', content: m.content, seq: m.seq });
     } else if (m.role === 'assistant') {
       (m.tool_calls || []).forEach((tc) => {
         toolNameById[tc.id] = tc.function?.name;
       });
-      if (m.content) out.push({ role: 'assistant', content: m.content });
+      if (m.content) out.push({ role: 'assistant', content: m.content, seq: m.seq });
     } else if (m.role === 'tool') {
       let result = null;
       try { result = JSON.parse(m.content); } catch { result = null; }
@@ -219,6 +223,7 @@ const mapHistoryMessages = (msgs) => {
         toolName: toolNameById[m.tool_call_id] || '工具调用',
         toolArgs: {},
         toolResult: result,
+        seq: m.seq,
       });
     }
   });
@@ -229,6 +234,11 @@ const mapHistoryMessages = (msgs) => {
  * AI 文件助手（首页主体，全站唯一的文件搜索入口）
  * 找文件直接在对话里描述内容即可；助手同时负责文件管理操作与危险操作确认。
  * 对话历史持久化在服务端（MySQL），左侧栏可查看/恢复/删除历史会话。
+ *
+ * 并发模型：genRef 是请求代际计数器——发送/切换会话/新建/停止/卸载都会递增它，
+ * 在途流的回调比对捕获时的代际，不一致即丢弃。这消除了三类竞态：
+ * 出错后立刻重发的双流并行写、切换会话窗口期旧流写入新视图、旧流 done 把
+ * currentConvId 劫持回旧会话。
  */
 export default function AssistantChat() {
   const { user, logout } = useAuth();
@@ -239,10 +249,58 @@ export default function AssistantChat() {
   const [currentConvId, setCurrentConvId] = useState(null);
   const [confirmData, setConfirmData] = useState(null);
   const [convs, setConvs] = useState([]);
+  const [convTotal, setConvTotal] = useState(0);
+  const [convLoading, setConvLoading] = useState(false);
+  const [hasOlder, setHasOlder] = useState(false);
+  const [loadingOlder, setLoadingOlder] = useState(false);
   const abortRef = useRef(null);
   const endRef = useRef(null);
+  const listRef = useRef(null);
+  const genRef = useRef(0);
+  const autoScrollRef = useRef(true);   // 用户上滚后暂停自动滚底，回到底部自动恢复
+  const deltaBufRef = useRef('');       // 流式增量缓冲（节流合并渲染）
+  const flushTimerRef = useRef(null);
 
-  useEffect(() => { endRef.current?.scrollIntoView({ behavior: 'smooth' }); }, [messages, thinking]);
+  // ── 流式增量节流：token 进缓冲，固定间隔合并刷一次 state ──
+  const flushDelta = useCallback(() => {
+    const delta = deltaBufRef.current;
+    if (!delta) return;
+    deltaBufRef.current = '';
+    setMessages((p) => {
+      const last = p[p.length - 1];
+      if (last && last.role === 'assistant' && last.streaming) {
+        const cp = [...p];
+        cp[cp.length - 1] = { ...last, content: last.content + delta };
+        return cp;
+      }
+      return [...p, { role: 'assistant', content: delta, streaming: true }];
+    });
+  }, []);
+
+  const stopFlushTimer = useCallback(() => {
+    if (flushTimerRef.current) {
+      clearInterval(flushTimerRef.current);
+      flushTimerRef.current = null;
+    }
+  }, []);
+
+  const queueDelta = useCallback((delta) => {
+    deltaBufRef.current += delta;
+    if (!flushTimerRef.current) {
+      flushTimerRef.current = setInterval(flushDelta, STREAM_FLUSH_MS);
+    }
+  }, [flushDelta]);
+
+  // 收尾：停计时器并把残余缓冲一次性刷出
+  const finishStreamText = useCallback(() => {
+    stopFlushTimer();
+    flushDelta();
+  }, [stopFlushTimer, flushDelta]);
+
+  const discardStreamText = useCallback(() => {
+    stopFlushTimer();
+    deltaBufRef.current = '';
+  }, [stopFlushTimer]);
 
   const addMsg = useCallback((msg) => setMessages((p) => [...p, msg]), []);
 
@@ -260,11 +318,30 @@ export default function AssistantChat() {
     });
   }, []);
 
+  // 卸载：作废在途回调 + 掐断 SSE（后端会兜底存档已生成部分）+ 清理计时器
+  useEffect(() => () => {
+    genRef.current += 1;
+    abortRef.current?.abort();
+    stopFlushTimer();
+  }, [stopFlushTimer]);
+
+  // 自动滚底只在用户本就位于底部时执行；上滚阅读不被打断
+  const handleListScroll = useCallback(() => {
+    const el = listRef.current;
+    if (!el) return;
+    autoScrollRef.current = el.scrollHeight - el.scrollTop - el.clientHeight < 60;
+  }, []);
+
+  useEffect(() => {
+    if (autoScrollRef.current) endRef.current?.scrollIntoView({ block: 'end' });
+  }, [messages, thinking]);
+
   // ── 历史会话 ──
   const refreshConvs = useCallback(async () => {
     try {
-      const { conversations } = await listConversations(user);
+      const { conversations, total } = await listConversations(user);
       setConvs(conversations);
+      setConvTotal(total);
     } catch (err) {
       if (err.tokenExpired) logout();
     }
@@ -272,54 +349,112 @@ export default function AssistantChat() {
 
   useEffect(() => { refreshConvs(); }, [refreshConvs]);
 
-  const handleOpenConv = useCallback(async (convId) => {
-    if (streaming || convId === currentConvId) return;
-    abortRef.current?.abort();
+  const loadMoreConvs = useCallback(async () => {
+    if (convLoading || convs.length >= convTotal) return;
+    setConvLoading(true);
     try {
-      const { messages: stored } = await fetchConversationMessages(user, convId);
+      const { conversations, total } = await listConversations(user, convs.length);
+      setConvs((p) => [...p, ...conversations]);
+      setConvTotal(total);
+    } catch (err) {
+      if (err.tokenExpired) logout();
+      else message.error(err.message || '加载历史会话失败');
+    } finally {
+      setConvLoading(false);
+    }
+  }, [user, convs.length, convTotal, convLoading, logout]);
+
+  const handleOpenConv = useCallback(async (convId) => {
+    if (convLoading || streaming || convId === currentConvId) return;
+    const gen = ++genRef.current;   // 作废在途流回调（若有）
+    abortRef.current?.abort();
+    setConvLoading(true);
+    autoScrollRef.current = true;
+    try {
+      const { messages: stored, hasOlder: older } = await fetchConversationMessages(user, convId);
+      if (gen !== genRef.current) return;  // 加载期间又切换/新建了会话
       setMessages(mapHistoryMessages(stored));
       setCurrentConvId(convId);
       setThinking(false);
       setConfirmData(null);
+      setHasOlder(older);
     } catch (err) {
       if (err.tokenExpired) logout();
+      else message.error(err.message || '读取会话失败');
+    } finally {
+      setConvLoading(false);
     }
-  }, [streaming, currentConvId, user, logout]);
+  }, [convLoading, streaming, currentConvId, user, logout]);
+
+  // 加载更早消息：按当前首条 seq 向上翻页，前插后保持滚动位置不跳
+  const handleLoadOlder = useCallback(async () => {
+    if (loadingOlder || !currentConvId) return;
+    const firstSeq = messages.find((m) => m.seq)?.seq;
+    if (!firstSeq) return;
+    setLoadingOlder(true);
+    try {
+      const { messages: older, hasOlder: more } = await fetchConversationMessages(user, currentConvId, firstSeq);
+      if (older.length) {
+        const el = listRef.current;
+        const prevHeight = el ? el.scrollHeight : 0;
+        setMessages((p) => [...mapHistoryMessages(older), ...p]);
+        requestAnimationFrame(() => {
+          const el2 = listRef.current;
+          if (el2) el2.scrollTop += el2.scrollHeight - prevHeight;
+        });
+      }
+      setHasOlder(more);
+    } catch (err) {
+      if (err.tokenExpired) logout();
+      else message.error(err.message || '加载更早消息失败');
+    } finally {
+      setLoadingOlder(false);
+    }
+  }, [loadingOlder, currentConvId, messages, user, logout]);
 
   const handleDeleteConv = useCallback(async (convId) => {
     try {
       await deleteConversation(user, convId);
       if (convId === currentConvId) {
         // 删的是当前会话：回到新对话状态
+        genRef.current += 1;
         abortRef.current?.abort();
+        discardStreamText();
         setMessages([]);
         setCurrentConvId(null);
         setStreaming(false);
         setThinking(false);
         setConfirmData(null);
+        setHasOlder(false);
       }
       refreshConvs();
     } catch (err) {
       if (err.tokenExpired) logout();
+      else message.error(err.message || '删除会话失败');
     }
-  }, [user, currentConvId, refreshConvs, logout]);
+  }, [user, currentConvId, refreshConvs, discardStreamText, logout]);
 
   const handleSend = useCallback(async () => {
     const text = input.trim();
-    if (!text || streaming) return;
+    if (!text || streaming || convLoading) return;
+    const gen = ++genRef.current;
     setInput('');
     setStreaming(true);
     setThinking(true);
+    autoScrollRef.current = true;
     addMsg({ role: 'user', content: text });
 
     abortRef.current = startChatStream(text, currentConvId, user, {
-      onThinking: () => setThinking(true),
+      onThinking: () => { if (gen === genRef.current) setThinking(true); },
       onToolCall: (d) => {
+        if (gen !== genRef.current) return;
         setThinking(false);
+        finishStreamText();
         closeStreamingBubble();
         addMsg({ role: 'tool', toolName: d.name, toolArgs: d.arguments });
       },
       onToolResult: (d) => {
+        if (gen !== genRef.current) return;
         setMessages((p) => {
           const cp = [...p];
           for (let i = cp.length - 1; i >= 0; i--) {
@@ -331,21 +466,17 @@ export default function AssistantChat() {
           return cp;
         });
       },
-      // 逐 token 增量：末尾是"还在打字"的 AI 气泡就追加，否则新开一条
+      // 逐 token 增量先进缓冲，按固定间隔合并渲染（见 STREAM_FLUSH_MS）
       onMessage: (d) => {
+        if (gen !== genRef.current) return;
         setThinking(false);
-        setMessages((p) => {
-          const last = p[p.length - 1];
-          if (last && last.role === 'assistant' && last.streaming) {
-            const cp = [...p];
-            cp[cp.length - 1] = { ...last, content: last.content + d.delta };
-            return cp;
-          }
-          return [...p, { role: 'assistant', content: d.delta, streaming: true }];
-        });
+        queueDelta(d.delta);
       },
-      // 收尾修正（下载链接重签）：整体替换最后一条 AI 气泡
+      // 收尾修正（下载链接重签）：整体替换最后一条 AI 气泡（全文已含缓冲内容）
       onMessageReplace: (d) => {
+        if (gen !== genRef.current) return;
+        discardStreamText();
+        setThinking(false);
         setMessages((p) => {
           const last = p[p.length - 1];
           if (last && last.role === 'assistant') {
@@ -357,53 +488,75 @@ export default function AssistantChat() {
         });
       },
       onConfirmRequired: (d) => {
+        if (gen !== genRef.current) return;
         setThinking(false);
+        finishStreamText();
         closeStreamingBubble();
         setConfirmData(d);
       },
       onError: (err) => {
+        if (gen !== genRef.current) return;
+        // 掐断旧流：后端发 error 之后仍会发 done，不掐断的话旧流的 done
+        // 会把用户紧接着发的新会话劫持回旧会话
+        abortRef.current?.abort();
+        discardStreamText();
         setThinking(false);
         setStreaming(false);
         closeStreamingBubble();
+        setConfirmData(null);   // 连接异常时确认单已无人消费，悬空弹窗直接收起
         if (err.tokenExpired) logout();
         else addMsg({ role: 'system', content: `出错了：${err.message}` });
       },
       onDone: (d) => {
+        if (gen !== genRef.current) return;
         setThinking(false);
         setStreaming(false);
+        finishStreamText();
         closeStreamingBubble();
         if (d.conv_id) setCurrentConvId(d.conv_id);
         refreshConvs();  // 新会话入库/标题更新后刷新侧栏排序
       },
     });
-  }, [input, streaming, currentConvId, user, addMsg, closeStreamingBubble, logout, refreshConvs]);
+  }, [input, streaming, convLoading, currentConvId, user, addMsg, closeStreamingBubble,
+    finishStreamText, discardStreamText, queueDelta, logout, refreshConvs]);
 
   // 停止生成：掐断连接（后端会把已生成的部分落库），界面立即恢复可输入
   const handleStop = useCallback(() => {
+    genRef.current += 1;   // 作废该流后续的 done/error 回调
     abortRef.current?.abort();
+    discardStreamText();
     closeStreamingBubble();
     setStreaming(false);
     setThinking(false);
+    setConfirmData(null);
     // 稍等后台存档完成再刷新侧栏，让半截回答反映到会话排序里
     setTimeout(() => refreshConvs(), 800);
-  }, [closeStreamingBubble, refreshConvs]);
+  }, [closeStreamingBubble, discardStreamText, refreshConvs]);
 
   const handleConfirm = useCallback(async (token, decision) => {
     setConfirmData(null);
     try {
       await confirmAction(user, token, decision);
     } catch (err) {
+      if (err.tokenExpired) {
+        logout();
+        return;
+      }
       addMsg({ role: 'system', content: `确认失败: ${err.message}` });
     }
-  }, [user, addMsg]);
+  }, [user, addMsg, logout]);
 
   const handleNewChat = () => {
+    genRef.current += 1;
     abortRef.current?.abort();
+    discardStreamText();
     setMessages([]);
     setCurrentConvId(null);
     setStreaming(false);
     setThinking(false);
     setConfirmData(null);
+    setHasOlder(false);
+    autoScrollRef.current = true;
   };
 
   const renderMessage = (m, i) => {
@@ -463,7 +616,7 @@ export default function AssistantChat() {
 
       <ChatLayout>
         <ConvSidebar>
-          {convs.length === 0 && (
+          {convs.length === 0 && !convLoading && (
             <Text type="secondary" style={{ fontSize: 12, textAlign: 'center', padding: '12px 0' }}>
               暂无历史会话
             </Text>
@@ -500,10 +653,20 @@ export default function AssistantChat() {
               </Popconfirm>
             </ConvItem>
           ))}
+          {convs.length < convTotal && (
+            <Button size="small" type="link" block onClick={loadMoreConvs} loading={convLoading}>
+              加载更多（{convs.length}/{convTotal}）
+            </Button>
+          )}
         </ConvSidebar>
 
         <div style={{ flex: 1, minWidth: 0 }}>
-          <MsgList>
+          <MsgList ref={listRef} onScroll={handleListScroll}>
+            {hasOlder && (
+              <Button size="small" type="link" onClick={handleLoadOlder} loading={loadingOlder}>
+                加载更早消息
+              </Button>
+            )}
             {messages.length === 0 && !thinking && (
           <div style={{ marginTop: 48 }}>
             <Empty
@@ -547,7 +710,7 @@ export default function AssistantChat() {
           }}
           placeholder="用自然语言描述你想找的文件，或让我统计、分享、删除文件..."
           autoSize={{ minRows: 1, maxRows: 4 }}
-          disabled={streaming}
+          disabled={streaming || convLoading}
           style={{ flex: 1 }}
         />
         <div style={{ display: 'flex', alignItems: 'center', gap: 8, marginTop: 8 }}>
@@ -565,7 +728,7 @@ export default function AssistantChat() {
               type="primary"
               icon={<SendOutlined />}
               onClick={handleSend}
-              disabled={!input.trim()}
+              disabled={!input.trim() || convLoading}
               block
             >
               发送
