@@ -4,6 +4,7 @@ import bcrypt
 from fastapi import APIRouter, Request
 from pydantic import BaseModel, Field
 from sqlalchemy import select
+from sqlalchemy.exc import IntegrityError
 from app.database import Session
 from app.models import UserInfo
 from app.redis_client import redis
@@ -30,20 +31,34 @@ class LoginRequest(BaseModel):
 
 
 def _client_ip(request: Request) -> str:
-    """取真实客户端 IP（Nginx 反代场景读 X-Forwarded-For 首段）"""
-    fwd = request.headers.get("x-forwarded-for", "")
-    if fwd:
-        return fwd.split(",")[0].strip()
+    """取真实客户端 IP。
+
+    只信 nginx 设置的 X-Real-IP（$remote_addr，单一可信反代）。
+    不能用 X-Forwarded-For 首段：nginx 以 $proxy_add_x_forwarded_for 追加，
+    首段是客户端自带值，可任意伪造——用它做限流键等于没限流。
+    """
+    real = request.headers.get("x-real-ip", "")
+    if real:
+        return real.strip()
     return request.client.host if request.client else "unknown"
+
+
+# INCR 与 EXPIRE(NX) 在 MULTI/EXEC 里原子执行：进程在两步之间崩溃时，
+# key 不会带着计数却永无 TTL（该 IP/用户名会被永久限流直到人工清 Redis）
+_RATE_LIMIT_LUA = """
+local n = redis.call('INCR', KEYS[1])
+if n == 1 then
+  redis.call('EXPIRE', KEYS[1], ARGV[1])
+end
+return n
+"""
 
 
 async def _rate_limit(bucket: str, ident: str, limit: int, window: int) -> bool:
     """固定窗口限流：超限返回 False"""
     key = f"rl:{bucket}:{ident}"
-    n = await redis.incr(key)
-    if n == 1:
-        await redis.expire(key, window)
-    return n <= limit
+    n = await redis.eval(_RATE_LIMIT_LUA, 1, key, window)
+    return int(n) <= limit
 
 
 def _make_hash(pwd_md5: str, salt: str) -> str:
@@ -68,6 +83,11 @@ async def register(body: RegRequest, request: Request):
     # 注册限流：每 IP 每小时 5 次
     if not await _rate_limit("reg", _client_ip(request), 5, 3600):
         return {"code": 7, "msg": "too many registrations"}
+
+    # bcrypt 只取前 72 字节（按 UTF-8 编码计），多字节密码超长直接拒绝——
+    # 静默截断会让前缀相同的长密码互相等价
+    if len(body.password.encode("utf-8")) > 72:
+        return {"code": 1, "msg": "密码过长（最多 72 字节）"}
 
     async with Session() as db:
         result = await db.execute(
@@ -99,7 +119,17 @@ async def register(body: RegRequest, request: Request):
             email=body.email,
         )
         db.add(user)
-        await db.commit()
+        try:
+            await db.commit()
+        except IntegrityError:
+            # 并发同名/同昵称注册：两个请求都通过前置检查，后提交方撞唯一约束。
+            # 转成业务码而非 500；回查确定撞的是哪个约束
+            await db.rollback()
+            dup_user = (await db.execute(
+                select(UserInfo.id).where(UserInfo.user_name == body.username)
+            )).scalar()
+            _hash_bcrypt(body.password)
+            return {"code": 2 if dup_user else 6, "msg": "username exists" if dup_user else "nickname exists"}
         return {"code": 0}
 
 
@@ -117,6 +147,9 @@ async def login(body: LoginRequest, request: Request):
         )
         user = result.scalar()
         if user is None:
+            # 时序对齐：用户不存在时同样执行一次 bcrypt 哈希再返回，
+            # 避免"存在→慢（哈希）/不存在→快"的响应时差被用来枚举有效用户名
+            _hash_bcrypt(body.pwd)
             return {"code": 1, "msg": "login failed"}
 
         if user.algo == BCRYPT_ALGO:
