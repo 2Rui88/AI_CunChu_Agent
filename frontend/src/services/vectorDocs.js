@@ -13,9 +13,14 @@ const post = async (url, body) => {
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify(body),
   });
-  const data = await resp.json();
+  let data;
+  try {
+    data = await resp.json();
+  } catch {
+    throw new Error(`服务响应异常 (HTTP ${resp.status})`);
+  }
   if (data.code === 4) {
-    const err = new Error('token expired');
+    const err = new Error('登录已过期');
     err.tokenExpired = true;
     throw err;
   }

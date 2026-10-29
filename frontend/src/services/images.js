@@ -18,14 +18,23 @@ const post = async (url, body) => {
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify(body),
   });
-  const data = await resp.json();
+  let data;
+  try {
+    data = await resp.json();
+  } catch {
+    throw new Error(`服务响应异常 (HTTP ${resp.status})`);
+  }
   if (data.code === 4) {
-    const err = new Error('token expired');
+    const err = new Error('登录已过期');
     err.tokenExpired = true;
     throw err;
   }
   return data;
 };
+
+// 上传进度分段：MD5 计算占 0-30%，传输占 30-100%——
+// 两段各自从 0 起算会让进度条肉眼可见地回跳
+const PROGRESS_MD5_SPAN = 30;
 
 /** 分块流式计算文件 MD5，避免大文件一次性读入内存 */
 const calculateMD5 = (file, onProgress) =>
@@ -38,7 +47,7 @@ const calculateMD5 = (file, onProgress) =>
       spark.append(e.target.result);
       offset += e.target.result.byteLength;
       if (onProgress) {
-        onProgress(Math.min(99, Math.round((offset / file.size) * 100)));
+        onProgress(Math.min(PROGRESS_MD5_SPAN, Math.round((offset / file.size) * PROGRESS_MD5_SPAN)));
       }
       if (offset < file.size) {
         readNext();
@@ -89,26 +98,34 @@ const uploadChunked = async (file, user, md5, onProgress) => {
 
   // 断点续传：跳过已上传分片
   const uploaded = new Set((init.uploadedChunks || '').split(',').filter(Boolean));
+  let doneCount = uploaded.size;
 
   for (let i = 0; i < chunkCount; i++) {
     if (uploaded.has(String(i))) continue;
     const blob = file.slice(i * chunkSize, (i + 1) * chunkSize);
+    // 鉴权信息走请求头而非 URL 查询串——token 进 URL 会留存于访问日志
     const resp = await fetch(
-      `${BASE}${E.CHUNK_UPLOAD}?md5=${md5}&index=${i}` +
-      `&user=${encodeURIComponent(user.username)}&token=${encodeURIComponent(user.token)}`,
+      `${BASE}${E.CHUNK_UPLOAD}?md5=${md5}&index=${i}`,
       {
         method: 'POST',
+        headers: {
+          'X-Upload-User': user.username,
+          'X-Upload-Token': user.token,
+        },
         body: blob,
       }
     );
     const data = await resp.json().catch(() => ({}));
     if (data.code === 4) {
-      const err = new Error('token expired');
+      const err = new Error('登录已过期');
       err.tokenExpired = true;
       throw err;
     }
     if (data.code !== 0) throw new Error(data.msg || '分片上传失败');
-    if (onProgress) onProgress(Math.round(((i + 1) / chunkCount) * 100));
+    doneCount += 1;
+    if (onProgress) {
+      onProgress(PROGRESS_MD5_SPAN + Math.round((doneCount / chunkCount) * (100 - PROGRESS_MD5_SPAN)));
+    }
   }
 
   const merge = await post(`${BASE}${E.CHUNK_MERGE}`, {
@@ -151,9 +168,14 @@ export const uploadImage = async (file, user, onProgress) => {
   form.append('md5', md5);
 
   const resp = await fetch(`${BASE}${E.UPLOAD}`, { method: 'POST', body: form });
-  const data = await resp.json();
+  let data;
+  try {
+    data = await resp.json();
+  } catch {
+    throw new Error(`服务响应异常 (HTTP ${resp.status})`);
+  }
   if (data.code === 4) {
-    const err = new Error('token expired');
+    const err = new Error('登录已过期');
     err.tokenExpired = true;
     throw err;
   }

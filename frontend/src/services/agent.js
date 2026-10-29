@@ -23,7 +23,7 @@ export const startChatStream = (message, convId, user, callbacks) => {
   })
     .then(async (response) => {
       if (response.status === 401) {
-        const err = new Error('token expired');
+        const err = new Error('登录已过期');
         err.tokenExpired = true;
         onError?.(err);
         return;
@@ -38,32 +38,49 @@ export const startChatStream = (message, convId, user, callbacks) => {
       let buffer = '';
       let currentEvent = '';
 
-      while (true) {
-        const { done, value } = await reader.read();
-        if (done) break;
-        buffer += decoder.decode(value, { stream: true });
-        const lines = buffer.split('\n');
-        buffer = lines.pop() || '';
-        for (const line of lines) {
-          if (line.startsWith('event: ')) {
-            currentEvent = line.slice(7).trim();
-          } else if (line.startsWith('data: ')) {
-            try {
-              const data = JSON.parse(line.slice(6));
-              switch (currentEvent) {
-                case 'thinking': onThinking?.(data); break;
-                case 'tool_call': onToolCall?.(data); break;
-                case 'tool_result': onToolResult?.(data); break;
-                case 'message': onMessage?.(data); break;
-                case 'message_replace': onMessageReplace?.(data); break;
-                case 'confirm_required': onConfirmRequired?.(data); break;
-                case 'error': onError?.(new Error(data.message)); break;
-                case 'done': onDone?.(data); break;
-                default: break;
+      const dispatch = (line) => {
+        if (line.startsWith('event: ')) {
+          currentEvent = line.slice(7).trim();
+        } else if (line.startsWith('data: ')) {
+          try {
+            const data = JSON.parse(line.slice(6));
+            switch (currentEvent) {
+              case 'thinking': onThinking?.(data); break;
+              case 'tool_call': onToolCall?.(data); break;
+              case 'tool_result': onToolResult?.(data); break;
+              case 'message': onMessage?.(data); break;
+              case 'message_replace': onMessageReplace?.(data); break;
+              case 'confirm_required': onConfirmRequired?.(data); break;
+              case 'error': {
+                // 后端 SSE 没有 HTTP 状态码可承载 401，token 失效经 error
+                // 事件的 code=4 传达（与 JSON 接口的 code===4 约定一致）
+                const err = new Error(data.message || '服务异常');
+                if (data.code === 4) err.tokenExpired = true;
+                onError?.(err);
+                break;
               }
-            } catch { /* ignore parse errors */ }
-          }
+              case 'done': onDone?.(data); break;
+              default: break;
+            }
+          } catch { /* ignore parse errors */ }
         }
+      };
+
+      try {
+        while (true) {
+          const { done, value } = await reader.read();
+          if (done) break;
+          buffer += decoder.decode(value, { stream: true });
+          const lines = buffer.split('\n');
+          buffer = lines.pop() || '';
+          lines.forEach(dispatch);
+        }
+        // 流末尾可能残留不带换行的最后一行（连接在事件边界被切断）
+        buffer += decoder.decode();
+        if (buffer) dispatch(buffer);
+      } finally {
+        // 异常路径（回调抛错/中途取消）也释放 reader，避免底层连接悬着
+        try { reader.cancel(); } catch { /* already closed */ }
       }
     })
     .catch((err) => {
@@ -83,8 +100,18 @@ export const confirmAction = async (user, confirmationToken, decision) => {
       confirmation_token: confirmationToken, decision,
     }),
   });
-  const data = await resp.json();
-  if (data.code !== 0) throw new Error(data.msg || 'Confirmation failed');
+  let data;
+  try {
+    data = await resp.json();
+  } catch {
+    throw new Error(`服务响应异常 (HTTP ${resp.status})`);
+  }
+  if (data.code === 4) {
+    const err = new Error('登录已过期');
+    err.tokenExpired = true;
+    throw err;
+  }
+  if (data.code !== 0) throw new Error(data.msg || '确认失败');
   return data;
 };
 
@@ -95,9 +122,14 @@ const post = async (path, body) => {
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify(body),
   });
-  const data = await resp.json();
+  let data;
+  try {
+    data = await resp.json();
+  } catch {
+    throw new Error(`服务响应异常 (HTTP ${resp.status})`);
+  }
   if (data.code === 4) {
-    const err = new Error('token expired');
+    const err = new Error('登录已过期');
     err.tokenExpired = true;
     throw err;
   }
