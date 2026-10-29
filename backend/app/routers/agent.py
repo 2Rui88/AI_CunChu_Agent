@@ -15,15 +15,15 @@ from urllib.parse import unquote
 from fastapi import APIRouter
 from sse_starlette.sse import EventSourceResponse
 from pydantic import BaseModel
-from openai import AsyncOpenAI
 from sqlalchemy import select, func
 from app.config import settings
 from app.database import Session
-from app.models import AgentConversation, AgentMessage
+from app.models import AgentConversation, AgentMessage, UserFileList
 from app.dependencies import check_token
 from app.redis_client import redis
 from app.agent_tools import TOOLS, DESTRUCTIVE_TOOLS
 from app.minio_client import presign_url, BUCKET
+from app.dashscope_client import create_client
 
 router = APIRouter(prefix="/api/agent", tags=["agent"])
 
@@ -66,8 +66,53 @@ CONFIRM_WAIT_TIMEOUT = 300     # 等待用户确认的超时（秒）
 _DL_LINK_RE = re.compile(r"\((\s*)((?:https?://[^)\s]*)?/dl/[^)\s]*)(\s*)\)")
 
 
-def _resign_dl_links(text: str) -> str:
-    """把答案中指向 /dl/ 的下载链接重签为带有效签名的完整 URL。"""
+def _extract_dl_object_names(text: str) -> list[tuple[str, str]]:
+    """收集文本中待重签的 (object_name, 原始 URL)，已带签名的跳过"""
+    out = []
+    for m in _DL_LINK_RE.finditer(text):
+        url = m.group(2)
+        if "X-Amz-Signature" in url:
+            continue
+        path = url.split("?", 1)[0]
+        marker = f"/dl/{BUCKET}/"
+        pos = path.find(marker)
+        if pos < 0:
+            continue
+        object_name = unquote(path[pos + len(marker):])
+        if object_name:
+            out.append((object_name, url))
+    return out
+
+
+async def _resign_dl_links(user: str, text: str) -> str:
+    """把答案中指向 /dl/ 的下载链接重签为带有效签名的完整 URL。
+
+    只重签归属当前用户的对象：文本文件的"描述"就是文件内容本身，
+    会完整进入 LLM 上下文——不校验归属的话，恶意文件内容可诱导模型
+    输出指向他人对象路径的链接，后端照签即绕过私有桶访问控制。
+    不归属的链接原样保留（无签名 → 403，不泄露内容）。
+    """
+    pairs = _extract_dl_object_names(text)
+    if not pairs:
+        return text
+
+    # 对象名首段为 md5（对象命名固定为 {md5}/{filename}），批量校验归属
+    md5s = {obj.split("/", 1)[0] for obj, _ in pairs if "/" in obj}
+    owned: set[str] = set()
+    if md5s:
+        try:
+            async with Session() as db:
+                rows = (await db.execute(
+                    select(UserFileList.md5).where(
+                        UserFileList.user == user,
+                        UserFileList.md5.in_(md5s),
+                    ).distinct()
+                )).all()
+                owned = {r[0] for r in rows}
+        except Exception:
+            logging.getLogger("uvicorn.error").exception("重签链接归属校验失败，全部保留原文")
+            return text
+
     def _repl(m: re.Match) -> str:
         url = m.group(2)
         if "X-Amz-Signature" in url:
@@ -80,10 +125,13 @@ def _resign_dl_links(text: str) -> str:
         object_name = unquote(path[pos + len(marker):])
         if not object_name:
             return m.group(0)
+        if object_name.split("/", 1)[0] not in owned:
+            return m.group(0)  # 非当前用户文件：不代签
         try:
             return f"({m.group(1)}{presign_url(object_name)}{m.group(3)})"
         except Exception:
             return m.group(0)  # 重签失败退回原文，不阻断回答
+
     return _DL_LINK_RE.sub(_repl, text)
 
 
@@ -319,12 +367,21 @@ def _safe_prefix(msgs: list[dict]) -> list[dict]:
 _bg_persist_tasks: set[asyncio.Task] = set()
 
 
-def _spawn_persist(conv_id: int, msgs: list[dict]) -> None:
+def _spawn_persist(conv_id: int, msgs: list[dict], resign_user: str = "") -> None:
     async def _run() -> None:
         try:
+            if resign_user:
+                # 断线兜底存档的半截文本未经收尾重签（生成器取消后 finally 里不能
+                # await）；在后台任务里补签，保证历史会话里的链接同样可点
+                for m in msgs:
+                    if m.get("role") == "assistant" and m.get("content"):
+                        m["content"] = await _resign_dl_links(resign_user, m["content"])
             await _persist_messages(conv_id, msgs)
         except Exception:
-            pass  # 兜底重试也失败则容忍丢失：提问已先落库，用户重问即可
+            # 兜底重试也失败则容忍丢失（提问已先落库，用户重问即可），但必须留痕可排查
+            logging.getLogger("uvicorn.error").exception(
+                "agent 会话兜底存档失败 conv_id=%s msgs=%d", conv_id, len(msgs)
+            )
 
     task = asyncio.create_task(_run())
     _bg_persist_tasks.add(task)
@@ -353,7 +410,8 @@ def _build_llm_context(history: list[dict], new_user_message: dict) -> list[dict
 async def agent_chat(body: ChatRequest):
     """Agent 对话入口 —— 返回 SSE 事件流"""
     if not await check_token(body.user, body.token):
-        return EventSourceResponse(_error_stream("token error"))
+        # code=4 标记 token 失效：SSE 场景没有 HTTP 状态码可承载，前端靠该字段登出
+        return EventSourceResponse(_error_stream("登录已过期，请重新登录", code=4))
 
     if not settings.dashscope_api_key:
         return EventSourceResponse(_error_stream("AI 服务未配置，请联系管理员"))
@@ -373,7 +431,8 @@ async def agent_chat(body: ChatRequest):
             yield await _sse("done", {"conv_id": "", "total_tool_calls": 0})
             return
 
-        client = AsyncOpenAI(api_key=settings.dashscope_api_key, base_url=settings.dashscope_api_base)
+        # 复用全局缓存客户端（httpx 连接池进程内共享）；每请求新建会泄漏连接
+        client = create_client(settings.dashscope_api_key)
         tool_count = 0
         base = len(messages)        # 本轮 assistant/tool 消息的追加起点
         committed = base            # 已落库的消息下标（分步提交的安全边界）
@@ -388,7 +447,9 @@ async def agent_chat(body: ChatRequest):
                 await _persist_messages(conv.id, messages[committed:upto])
                 committed = upto
             except Exception:
-                pass
+                logging.getLogger("uvicorn.error").exception(
+                    "agent 会话分步落库失败 conv_id=%s 批次=%d 条", conv.id, upto - committed
+                )
 
         try:
             for _ in range(settings.max_tool_calls_per_turn):
@@ -446,7 +507,7 @@ async def agent_chat(body: ChatRequest):
                 if not tool_calls:
                     if not text:
                         continue  # 模型空响应：与旧实现一致，进入下一轮重试
-                    final = _resign_dl_links(text)
+                    final = await _resign_dl_links(body.user, text)
                     if final != text:
                         yield await _sse("message_replace", {"content": final})
                     messages.append({"role": "assistant", "content": final})
@@ -546,7 +607,7 @@ async def agent_chat(body: ChatRequest):
                 ):
                     msgs.append({"role": "assistant", "content": streamed_text})
                 if msgs:
-                    _spawn_persist(conv.id, msgs)
+                    _spawn_persist(conv.id, msgs, resign_user=body.user)
 
     return EventSourceResponse(event_generator())
 
@@ -705,7 +766,10 @@ async def _sse(event_type: str, data: dict) -> dict:
     return {"event": event_type, "data": json.dumps(data, ensure_ascii=False)}
 
 
-async def _error_stream(msg: str):
-    """返回错误 SSE 流"""
-    yield {"event": "error", "data": json.dumps({"message": msg}, ensure_ascii=False)}
+async def _error_stream(msg: str, code: int | None = None):
+    """返回错误 SSE 流；code 附带业务错误码（如 4=token 失效）供前端识别"""
+    data = {"message": msg}
+    if code is not None:
+        data["code"] = code
+    yield {"event": "error", "data": json.dumps(data, ensure_ascii=False)}
     yield {"event": "done", "data": json.dumps({"conv_id": "", "total_tool_calls": 0}, ensure_ascii=False)}

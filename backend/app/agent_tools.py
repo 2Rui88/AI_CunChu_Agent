@@ -16,6 +16,7 @@ Agent 工具集 —— 7 个文件操作工具，供 ReAct Agent Loop 调用
 """
 import re
 import asyncio
+import logging
 from sqlalchemy import select, delete as sql_delete
 from app.database import Session
 from app.models import (
@@ -146,7 +147,12 @@ async def tool_list_recent_files(username: str, **kwargs) -> dict:
     列出用户最近上传的文件。
     LLM 参数: count (int, 可选, 默认10)
     """
-    count = min(int(kwargs.get("count", 10)), 50)
+    # 解析在 try 内并双向钳制：LLM 传 count=null 会让 int(None) 抛 TypeError
+    # 白耗一轮重试，传 0/负数则返回空列表
+    try:
+        count = max(1, min(int(kwargs.get("count") or 10), 50))
+    except (TypeError, ValueError):
+        count = 10
 
     try:
         async with Session() as db:
@@ -273,10 +279,16 @@ async def tool_delete_file(username: str, **kwargs) -> dict:
     """
     删除用户文件（危险操作）。
     LLM 参数: identifier (str) — md5 或文件名
+    MinIO 对象删除放在事务提交之后（与 share.py _del_file 对齐）：
+    提交前删对象而 commit 失败会弄丢仍被引用的文件数据，提交后删失败
+    只是留下记日志的孤儿对象。
     """
     identifier = kwargs.get("identifier", "")
     if not identifier:
         return {"error": "missing identifier"}
+
+    fileid = None
+    object_to_remove = None
 
     try:
         async with Session() as db:
@@ -295,7 +307,7 @@ async def tool_delete_file(username: str, **kwargs) -> dict:
 
             ufl, fi = row
 
-            # 清理分享记录
+            # 清理分享记录（Redis 部分推迟到 commit 之后）
             if ufl.shared_status == 1:
                 await db.execute(
                     sql_delete(ShareFileList).where(
@@ -312,11 +324,6 @@ async def tool_delete_file(username: str, **kwargs) -> dict:
                 if ufc_pub and ufc_pub.count > 0:
                     ufc_pub.count -= 1
                 fileid = f"{ufl.md5}{ufl.file_name}"
-                try:
-                    await redis.zrem("FILE_PUBLIC_ZSET", fileid)
-                    await redis.hdel("FILE_NAME_HASH", fileid)
-                except Exception:
-                    pass
 
             # 删除 AI 记录
             await db.execute(
@@ -345,16 +352,29 @@ async def tool_delete_file(username: str, **kwargs) -> dict:
             if fi is not None:
                 fi.count -= 1
                 if fi.count <= 0:
-                    try:
-                        await asyncio.to_thread(minio_client.remove_object, BUCKET, fi.file_id)
-                    except Exception:
-                        pass
+                    object_to_remove = fi.file_id
                     await db.delete(fi)
             # file_info 已被并发删除（引用恰好归零）时无需引用处理，继续删除用户关联
 
             await db.commit()
     except Exception as exc:
         return {"error": f"delete failed: {exc}"}
+
+    # 提交成功后的收尾：Redis 清理 + MinIO 对象删除
+    if fileid:
+        try:
+            await redis.zrem("FILE_PUBLIC_ZSET", fileid)
+            await redis.hdel("FILE_NAME_HASH", fileid)
+        except Exception:
+            pass
+    if object_to_remove:
+        try:
+            await asyncio.to_thread(minio_client.remove_object, BUCKET, object_to_remove)
+        except Exception:
+            logging.getLogger("uvicorn.error").exception(
+                "MinIO 对象删除失败（孤儿对象残留）bucket=%s object=%s",
+                BUCKET, object_to_remove,
+            )
 
     # 标记 FAISS 脏
     try:

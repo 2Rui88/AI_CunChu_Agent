@@ -14,10 +14,18 @@ import httpx
 from openai import AsyncOpenAI
 from app.config import settings
 
+# 进程级客户端缓存：AsyncOpenAI 内含 httpx 连接池，每请求新建从不关闭会累积
+# 未释放连接；同 key 复用同一实例，连接池随进程生命周期管理。
+_client_cache: dict[str, AsyncOpenAI] = {}
+
 
 def create_client(api_key: str) -> AsyncOpenAI:
-    """创建指向 DashScope 兼容端点的 OpenAI 客户端（用于 Agent chat + embedding）"""
-    return AsyncOpenAI(api_key=api_key, base_url=settings.dashscope_api_base)
+    """返回指向 DashScope 兼容端点的 OpenAI 客户端（Agent chat + embedding 共用，按 key 缓存）"""
+    client = _client_cache.get(api_key)
+    if client is None:
+        client = AsyncOpenAI(api_key=api_key, base_url=settings.dashscope_api_base)
+        _client_cache[api_key] = client
+    return client
 
 
 async def describe_image(api_key: str, image_url: str) -> str:
