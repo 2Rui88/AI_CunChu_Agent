@@ -6,6 +6,7 @@ Redis Key:
   FILE_NAME_HASH     —— fileid -> filename 映射
 """
 import asyncio
+import logging
 from fastapi import APIRouter, Request
 from sqlalchemy import select, update, delete
 from sqlalchemy.exc import IntegrityError
@@ -111,9 +112,12 @@ async def _share_file(user: str, md5_val: str, filename: str) -> dict:
 async def _del_file(user: str, md5_val: str, filename: str) -> dict:
     """
     删除文件 —— 处理分享关联、用户关联、引用计数、AI 记录
-    只有当 file_info.count 减到 0 时才物理删除 MinIO 文件
+    只有当 file_info.count 减到 0 时才物理删除 MinIO 文件。
+    MinIO 删除放在事务提交之后：提交前删对象而 commit 失败会反过来弄丢
+    仍在被引用的文件数据；提交后删失败仅留下可排查的孤儿对象（记日志）。
     """
     fileid = f"{md5_val}{filename}"
+    object_to_remove = None
 
     async with Session() as db:
         # 查询用户文件关联
@@ -130,7 +134,7 @@ async def _del_file(user: str, md5_val: str, filename: str) -> dict:
 
         shared = ufl.shared_status
 
-        # 如果已分享，清理分享相关数据
+        # 如果已分享，清理分享关联数据（Redis 部分推迟到 commit 之后）
         if shared == 1:
             delete_result = await db.execute(
                 delete(ShareFileList).where(
@@ -149,9 +153,6 @@ async def _del_file(user: str, md5_val: str, filename: str) -> dict:
             ufc = result.scalar()
             if ufc and ufc.count > 0:
                 ufc.count -= 1
-            # Redis 中移除
-            await redis.zrem(FILE_PUBLIC_ZSET, fileid)
-            await redis.hdel(FILE_NAME_HASH, fileid)
 
         # 删除用户 AI 描述记录
         await db.execute(
@@ -178,15 +179,28 @@ async def _del_file(user: str, md5_val: str, filename: str) -> dict:
         fi = result.scalar()
         if fi:
             fi.count -= 1
-            # 没有任何用户引用时，物理删除文件
+            # 没有任何用户引用时，物理删除文件（对象本身推迟到 commit 后）
             if fi.count <= 0:
-                try:
-                    await asyncio.to_thread(client.remove_object, BUCKET, fi.file_id)
-                except Exception:
-                    pass
+                object_to_remove = fi.file_id
                 await db.delete(fi)
 
         await db.commit()
+
+    # 提交成功后的收尾：Redis 清理（失败由懒重建兜底）+ MinIO 对象删除
+    if shared == 1:
+        try:
+            await redis.zrem(FILE_PUBLIC_ZSET, fileid)
+            await redis.hdel(FILE_NAME_HASH, fileid)
+        except Exception:
+            pass
+    if object_to_remove:
+        try:
+            await asyncio.to_thread(client.remove_object, BUCKET, object_to_remove)
+        except Exception:
+            logging.getLogger("uvicorn.error").exception(
+                "MinIO 对象删除失败（孤儿对象残留）bucket=%s object=%s",
+                BUCKET, object_to_remove,
+            )
 
     # 标记 FAISS 需要重建（下次搜索自动触发）
     mark_dirty(user)
