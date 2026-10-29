@@ -106,14 +106,29 @@ const FileList = () => {
     }
   };
 
-  const handleDelete = async (record) => {
-    try {
-      await deleteImage(record, user);
-      message.success('删除成功！');
-      fetchFiles();
-    } catch (error) {
-      message.error(error.message || '删除失败！');
-    }
+  // 与 Agent 的删除确认门控保持同一基线：文件列表单击即硬删除、无恢复入口
+  const handleDelete = (record) => {
+    Modal.confirm({
+      title: '删除文件',
+      content: `确定删除「${record.file_name}」？该操作不可恢复。`,
+      okText: '删除',
+      okButtonProps: { danger: true },
+      cancelText: '取消',
+      onOk: async () => {
+        try {
+          await deleteImage(record, user);
+          message.success('删除成功！');
+          fetchFiles();
+        } catch (error) {
+          if (error.tokenExpired) {
+            message.error('登录已过期，请重新登录');
+            logout();
+            return;
+          }
+          message.error(error.message || '删除失败！');
+        }
+      },
+    });
   };
 
   const handleShare = async (record) => {
@@ -122,6 +137,11 @@ const FileList = () => {
       message.success('分享成功！');
       fetchFiles();
     } catch (error) {
+      if (error.tokenExpired) {
+        message.error('登录已过期，请重新登录');
+        logout();
+        return;
+      }
       message.error(error.message || '分享失败！');
     }
   };
@@ -132,6 +152,11 @@ const FileList = () => {
       message.success('已取消分享');
       fetchFiles();
     } catch (error) {
+      if (error.tokenExpired) {
+        message.error('登录已过期，请重新登录');
+        logout();
+        return;
+      }
       message.error(error.message || '取消分享失败！');
     }
   };

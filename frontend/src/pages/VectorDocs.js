@@ -71,7 +71,7 @@ const VectorDocs = () => {
   const [totalVectors, setTotalVectors] = useState(0);
   const [loading, setLoading] = useState(false);
   const [filter, setFilter] = useState('');
-  const [drawer, setDrawer] = useState({ open: false, loading: false, file: null, chunks: [] });
+  const [drawer, setDrawer] = useState({ open: false, loading: false, file: null, chunks: [], error: null });
   const { user, logout } = useAuth();
 
   const fetchDocs = async () => {
@@ -99,18 +99,20 @@ const VectorDocs = () => {
   }, [user]);
 
   const openDoc = async (record) => {
-    setDrawer({ open: true, loading: true, file: null, chunks: [] });
+    setDrawer({ open: true, loading: true, file: null, chunks: [], error: null });
     try {
       const { file, chunks } = await fetchVectorChunks(user, record.md5);
-      setDrawer({ open: true, loading: false, file, chunks });
+      setDrawer({ open: true, loading: false, file, chunks, error: null });
     } catch (error) {
       if (error.tokenExpired) {
         message.error('登录已过期，请重新登录');
         logout();
         return;
       }
-      message.error(error.message || '获取切分明细失败');
-      setDrawer((d) => ({ ...d, loading: false }));
+      const msg = error.message || '获取切分明细失败';
+      message.error(msg);
+      // 带 error 落状态：抽屉里给出错误视图，而不是既非加载也无数据的空白
+      setDrawer((d) => ({ ...d, loading: false, error: msg }));
     }
   };
 
@@ -279,7 +281,7 @@ const VectorDocs = () => {
 
       <Drawer
         open={drawer.open}
-        onClose={() => setDrawer({ open: false, loading: false, file: null, chunks: [] })}
+        onClose={() => setDrawer({ open: false, loading: false, file: null, chunks: [], error: null })}
         width={720}
         title={(
           <Space>
@@ -292,6 +294,11 @@ const VectorDocs = () => {
           <div style={{ textAlign: 'center', padding: '80px 0' }}>
             <Spin tip="加载切分明细..." />
           </div>
+        ) : drawer.error ? (
+          <Empty
+            image={Empty.PRESENTED_IMAGE_SIMPLE}
+            description={<Typography.Text type="danger">{drawer.error}</Typography.Text>}
+          />
         ) : (file && (
           <>
             <Descriptions

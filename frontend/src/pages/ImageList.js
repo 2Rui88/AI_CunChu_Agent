@@ -169,14 +169,29 @@ const ImageList = () => {
     }
   };
 
-  const handleDelete = async (image) => {
-    try {
-      await deleteImage(image, user);
-      message.success('删除成功！');
-      fetchImages();
-    } catch (error) {
-      message.error(error.message || '删除失败！');
-    }
+  // 与 Agent 的删除确认门控保持同一基线：图片卡单击即硬删除、无恢复入口
+  const handleDelete = (image) => {
+    Modal.confirm({
+      title: '删除图片',
+      content: `确定删除「${image.name}」？该操作不可恢复。`,
+      okText: '删除',
+      okButtonProps: { danger: true },
+      cancelText: '取消',
+      onOk: async () => {
+        try {
+          await deleteImage(image, user);
+          message.success('删除成功！');
+          fetchImages();
+        } catch (error) {
+          if (error.tokenExpired) {
+            message.error('登录已过期，请重新登录');
+            logout();
+            return;
+          }
+          message.error(error.message || '删除失败！');
+        }
+      },
+    });
   };
 
   useEffect(() => {
@@ -197,6 +212,11 @@ const ImageList = () => {
       message.success('分享成功！');
       fetchImages();
     } catch (error) {
+      if (error.tokenExpired) {
+        message.error('登录已过期，请重新登录');
+        logout();
+        return;
+      }
       message.error(error.message || '分享失败！');
     }
   };
@@ -207,6 +227,11 @@ const ImageList = () => {
       message.success('已取消分享');
       fetchImages();
     } catch (error) {
+      if (error.tokenExpired) {
+        message.error('登录已过期，请重新登录');
+        logout();
+        return;
+      }
       message.error(error.message || '取消分享失败！');
     }
   };
