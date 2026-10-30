@@ -810,11 +810,12 @@ async def _classify_query(query: str, api_key: str) -> str:
         return "模糊"
 
 
-async def _rewrite_and_embed(query: str, api_key: str) -> np.ndarray:
+async def _rewrite_and_embed(query: str, api_key: str, timing: dict | None = None) -> np.ndarray:
     """
     对模糊查询生成 3 个变体，分别 embedding，返回均值向量。
     """
     # 生成变体
+    rewrite_started = time.perf_counter()
     try:
         client = create_client(api_key)
         resp = await client.chat.completions.create(
@@ -828,8 +829,11 @@ async def _rewrite_and_embed(query: str, api_key: str) -> np.ndarray:
             variants = [query]
     except Exception:
         variants = [query]
+    if timing is not None:
+        timing["query_rewrite_ms"] = round((time.perf_counter() - rewrite_started) * 1000, 1)
 
     # 分别 embedding 取均值
+    embedding_started = time.perf_counter()
     vecs = []
     for v in variants[:3]:
         try:
@@ -840,8 +844,12 @@ async def _rewrite_and_embed(query: str, api_key: str) -> np.ndarray:
 
     if not vecs:
         emb = await get_embedding(api_key, query)
+        if timing is not None:
+            timing["embedding_ms"] = round((time.perf_counter() - embedding_started) * 1000, 1)
         return np.array(emb, dtype=np.float32)
 
+    if timing is not None:
+        timing["embedding_ms"] = round((time.perf_counter() - embedding_started) * 1000, 1)
     avg = np.mean(vecs, axis=0)
     return l2_normalize(avg)
 
@@ -988,6 +996,9 @@ async def semantic_search(user: str, query: str, top_k: int = 10,
     MySQL 关键词路 → RRF 双路融合 → LLM 重排序。
     返回 {"code": 0, "count": n, "files": [...]} 或 {"code": 1, "msg": ...}
     """
+    search_started = time.perf_counter()
+    timing: dict[str, float] = {}
+
     # 密钥统一取服务端配置（客户端传入的 api_key 一律忽略，防泄露）
     if api_key is None:
         api_key = settings.dashscope_api_key
@@ -998,12 +1009,14 @@ async def semantic_search(user: str, query: str, top_k: int = 10,
         return {"code": 1, "msg": "AI 服务未配置，请联系管理员"}
 
     # 脏标记检测 → 自动重建索引（文件删除后触发）
+    dirty_started = time.perf_counter()
     if is_dirty(user):
         try:
             await _auto_rebuild_if_dirty(user)
         except Exception:
             logger.exception("搜索前自动重建索引失败，用现存索引继续")
             pass  # 重建失败不影响搜索，用现存索引继续
+    timing["dirty_index_ms"] = round((time.perf_counter() - dirty_started) * 1000, 1)
 
     keywords = _extract_keywords(query)
     index_ready = await asyncio.to_thread(get_ntotal, user) > 0
@@ -1015,22 +1028,28 @@ async def semantic_search(user: str, query: str, top_k: int = 10,
         features = _detect_query_features(query)
 
         # 结构特征未命中时用 LLM 二次分类
+        classify_started = time.perf_counter()
         if not features["is_precise"]:
             qtype = await _classify_query(query, api_key)
         else:
             qtype = "精确"
+        timing["query_classify_ms"] = round((time.perf_counter() - classify_started) * 1000, 1)
 
         # 模糊查询 → 改写 + 均值向量；精确查询 → 原始 embedding
         if qtype == "模糊":
-            query_vec = await _rewrite_and_embed(query, api_key)
+            query_vec = await _rewrite_and_embed(query, api_key, timing)
         else:
+            embedding_started = time.perf_counter()
             try:
                 embedding = await get_embedding(api_key, query)
             except RuntimeError as exc:
                 return {"code": 1, "msg": f"embedding failed: {exc}"}
             query_vec = np.array(embedding, dtype=np.float32)
+            timing["embedding_ms"] = round((time.perf_counter() - embedding_started) * 1000, 1)
         try:
+            faiss_started = time.perf_counter()
             results = await asyncio.to_thread(faiss_search, user, query_vec, top_k)
+            timing["faiss_ms"] = round((time.perf_counter() - faiss_started) * 1000, 1)
         except Exception as exc:
             return {"code": 1, "msg": f"faiss search failed: {exc}"}
 
@@ -1042,7 +1061,9 @@ async def semantic_search(user: str, query: str, top_k: int = 10,
         fallback_kw = query.strip()[:64]
         if fallback_kw:
             keywords = [fallback_kw]
+    mysql_keyword_started = time.perf_counter()
     kw_files = await _keyword_search(user, keywords, query=query, limit=top_k) if keywords else []
+    timing["mysql_keyword_ms"] = round((time.perf_counter() - mysql_keyword_started) * 1000, 1)
 
     # ── faiss_id → MySQL 联表查询（向量路，含 context_label）──
     # 一次 IN 批量回查（替代逐 id 单查的 N+1），结果取齐即退出会话——
@@ -1050,6 +1071,7 @@ async def semantic_search(user: str, query: str, top_k: int = 10,
     vec_ranked: dict[str, dict] = {}  # md5 → {file info, rank, vector_score}
     valid = [(fid, score) for fid, score in results if score >= SCORE_THRESHOLD]
     if valid:
+        mysql_vector_started = time.perf_counter()
         async with Session() as db:
             db_rows = (await db.execute(
                 select(UserFileAiDesc, UserFileList, FileInfo)
@@ -1086,6 +1108,9 @@ async def semantic_search(user: str, query: str, top_k: int = 10,
                         "match_context": uad.context_label or "",
                         "chunk_index": uad.chunk_index,
                     }
+        timing["mysql_vector_join_ms"] = round((time.perf_counter() - mysql_vector_started) * 1000, 1)
+    else:
+        timing["mysql_vector_join_ms"] = 0.0
 
     # ── RRF 双路排名融合（纯内存计算，无 DB 会话）──
     K = 60
@@ -1114,19 +1139,28 @@ async def semantic_search(user: str, query: str, top_k: int = 10,
             file_map[md5] = kf
 
     # RRF 降序排列
+    rrf_started = time.perf_counter()
     sorted_md5s = sorted(rrf_scores, key=lambda m: rrf_scores[m], reverse=True)
     files = []
     for md5 in sorted_md5s:
         f = file_map[md5]
         f["rrf_score"] = round(rrf_scores[md5], 5)
         files.append(f)
+    timing["rrf_ms"] = round((time.perf_counter() - rrf_started) * 1000, 1)
 
     # ── LLM 重排序（Top-20 → Top-10；秒级 LLM 调用，务必在 DB 会话之外）──
     if len(files) > 1 and api_key:
+        rerank_started = time.perf_counter()
         try:
             files = await _rerank_with_llm(query, files[:20], api_key)
         except Exception:
             pass  # 失败降级：保留 RRF 排名
+        timing["llm_rerank_ms"] = round((time.perf_counter() - rerank_started) * 1000, 1)
+    else:
+        timing["llm_rerank_ms"] = 0.0
+
+    timing["total_ms"] = round((time.perf_counter() - search_started) * 1000, 1)
+    logger.info("SEARCH_TIMING user=%s query=%r timing=%s", user, query, timing)
 
     return {"code": 0, "count": len(files), "files": files}
 
