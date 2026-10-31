@@ -11,8 +11,8 @@ Agent 工具集 —— 7 个文件操作工具，供 ReAct Agent Loop 调用
   DESTRUCTIVE: delete_file, share_file（需用户二次确认）
 
 注：对话式助手是全站唯一的文件搜索入口——search_files 委托
-    ai.semantic_search 全链路（查询改写 + 双路召回 + RRF + 重排），
-    独立的搜索框与 /ai/search 端点已移除。
+    ai.semantic_search 全链路（一次 LLM 查询规划 + 双路召回 + 统一 RRF +
+    候选>5 时重排），独立的搜索框与 /ai/search 端点已移除。
 """
 import re
 import asyncio
@@ -61,7 +61,7 @@ async def tool_search_files(username: str, **kwargs) -> dict:
     """
     语义搜索用户文件（全站唯一搜索入口）。
     LLM 参数: query (str), top_k (int, 可选, 默认5)
-    检索委托 ai.semantic_search 全链路：查询改写 + 双路召回 + RRF 融合 + 重排序。
+    检索委托 ai.semantic_search 全链路：一次 LLM 查询规划 + 双路召回 + 统一 RRF 融合 + 候选>5 时重排序。
     """
     query = kwargs.get("query", "")
     # top_k 钳制（LLM 给出的参数不可信）

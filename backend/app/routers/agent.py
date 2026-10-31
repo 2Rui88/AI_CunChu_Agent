@@ -31,7 +31,7 @@ router = APIRouter(prefix="/api/agent", tags=["agent"])
 SYSTEM_PROMPT = """你是 AI云存储 的文件管理助手，也是用户查找文件的唯一入口。你可以帮助用户搜索和管理他们的文件。
 
 你的能力:
-- 语义搜索文件（search_files，全链路：查询改写 + 双路召回 + 重排序）
+- 语义搜索文件（search_files，全链路：查询规划 + 双路召回 + 统一排序）
 - 查看文件详细信息（get_file_info）
 - 列出最近上传的文件（list_recent_files）
 - 查看存储统计（get_storage_stats）

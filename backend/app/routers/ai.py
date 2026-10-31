@@ -6,12 +6,14 @@ describe: 生成文件 AI 描述 + 向量 → 存入 MySQL + FAISS
   - 文本(txt/md/py/...) → 下载读取内容作为描述
   - docx → 解压提取 XML 文本作为描述
   - 其他 → 类型 + 文件名拼接描述
-search:   语义搜索引擎 semantic_search（查询改写 + 双路召回 + RRF + 重排），
-          不再暴露独立 HTTP 端点——对话助手 search_files 工具是唯一调用方
+search:   语义搜索引擎 semantic_search（一次 LLM 查询规划 + 双路召回 +
+          统一 RRF + 候选>5 时重排），不再暴露独立 HTTP 端点——
+          对话助手 search_files 工具是唯一调用方
 rebuild:  从 MySQL 全量重建用户 FAISS 索引
 """
 import io
 import re
+import json
 import time
 import html
 import asyncio
@@ -752,122 +754,144 @@ async def _auto_rebuild_if_dirty(user: str):
 
 
 # ═══════════════════════════════════════════════════════════
-#  查询预处理 —— 特征检测 / 分类 / 改写
+#  查询规划 —— 一次 LLM 调用完成类型判断 / 改写 / 关键词生成
 # ═══════════════════════════════════════════════════════════
 
-# 精确锚点正则（扩展名、日期、编号、英文词）
-_RE_PRECISE = re.compile(
-    r"\.\w{2,5}$"              # 扩展名 .pdf .xlsx
-    r"|\d{4}[年\-]\d{1,2}"     # 日期 2024-03 / 2024年3
-    r"|[Qq]\d"                 # 季度 Q1 Q3
-    r"|v\d+\.\d+"              # 版本 v2.0 v3.1
-    r"|#\d+"                   # 编号 #1024
-    r"|[a-zA-Z]{3,}"           # 英文词
-)
-# 模糊查询改写 prompt
-_REWRITE_PROMPT = (
-    "将以下自然语言查询改写为3个同义搜索短语，每行一个，只输出短语不要解释。\n"
-    "查询: {query}"
+# 规划结果约束（程序侧仅做结构校验，不做任何语义层面的类型判断）
+_PLAN_MAX_QUERIES = 5          # vector_queries 条数上限
+_PLAN_MAX_KEYWORDS = 8         # mysql_keywords 条数上限
+_PLAN_MAX_QUERY_CHARS = 128    # 单条改写查询长度上限
+_PLAN_MAX_KEYWORD_CHARS = 64   # 单个关键词长度上限
+
+_PLAN_PROMPT = (
+    "你是文件搜索系统的查询规划器。分析用户查询，判断查询类型并生成两路召回参数，"
+    "只输出一个 JSON 对象，不要任何解释，不要代码块标记。\n"
+    "输出格式：\n"
+    '{{"query_type": "fuzzy 或 exact", "vector_queries": ["..."], "mysql_keywords": ["..."]}}\n'
+    "判断规则：\n"
+    "- 查询是对文件内容的模糊描述（如\"讲分布式存储的那份资料\"）→ query_type 为 fuzzy\n"
+    "- 查询含精确锚点：完整或部分文件名、扩展名、日期、编号、版本号、专有名词"
+    "（如\"季度报告Q3.xlsx\"）→ query_type 为 exact\n"
+    "参数规则：\n"
+    "- fuzzy：vector_queries 给 3 个同义改写查询；mysql_keywords 通常为空数组，"
+    "仅当查询中确有适合文件名精确匹配的词时才给出\n"
+    "- exact：mysql_keywords 给出文件名中可能原样出现的关键词"
+    "（扩展名、日期、编号、专有名词等）；vector_queries 给 1 个查询（原始或规范化后）\n"
+    "用户查询: {query}"
 )
 
 
-def _detect_query_features(query: str) -> dict:
-    """
-    零成本结构特征检测。
-    返回 {"is_precise": bool, "keywords": list[str]}。
-    命中扩展名/日期/编号等精确锚点时标记 is_precise=True。
-    """
-    keywords: list[str] = []
-    for m in _RE_PRECISE.finditer(query):
-        kw = m.group().strip()
-        if kw:
-            keywords.append(kw)
+def _fallback_plan(query: str) -> dict:
+    """LLM 规划失败/结果非法时的安全降级：原始查询走单条向量召回，不跑关键词路"""
     return {
-        "is_precise": len(keywords) > 0,
-        "keywords": keywords,
+        "query_type": "fuzzy",
+        "vector_queries": [query],
+        "mysql_keywords": [],
     }
 
 
-async def _classify_query(query: str, api_key: str) -> str:
+def _clean_plan_list(value, max_items: int, max_chars: int) -> list[str]:
+    """清洗字符串数组：去非字符串项、去空白、截断超长、去重，最多保留 max_items 条"""
+    if not isinstance(value, list):
+        return []
+    seen: set[str] = set()
+    items: list[str] = []
+    for v in value:
+        if not isinstance(v, str):
+            continue
+        s = v.strip()[:max_chars]
+        if s and s not in seen:
+            seen.add(s)
+            items.append(s)
+        if len(items) >= max_items:
+            break
+    return items
+
+
+def _parse_plan(raw: str, query: str) -> dict:
     """
-    LLM 查询分类（约 10 token）。
-    返回 "模糊" 或 "精确"。
+    解析并校验 LLM 规划输出。程序只做结构检查：
+    JSON 合法性、query_type 是否为允许值、数组与字符串长度约束。
+    非法结果一律返回安全降级，不做语义层面的补救。
+    """
+    text = raw.strip()
+    # 容错剥掉 ```json ... ``` 围栏
+    if text.startswith("```"):
+        text = re.sub(r"^```[a-zA-Z]*\s*|\s*```$", "", text).strip()
+    start, end = text.find("{"), text.rfind("}")
+    if start < 0 or end <= start:
+        return _fallback_plan(query)
+    try:
+        data = json.loads(text[start:end + 1])
+    except ValueError:
+        return _fallback_plan(query)
+
+    if not isinstance(data, dict) or data.get("query_type") not in ("fuzzy", "exact"):
+        return _fallback_plan(query)
+
+    vector_queries = _clean_plan_list(
+        data.get("vector_queries"), _PLAN_MAX_QUERIES, _PLAN_MAX_QUERY_CHARS)
+    mysql_keywords = _clean_plan_list(
+        data.get("mysql_keywords"), _PLAN_MAX_KEYWORDS, _PLAN_MAX_KEYWORD_CHARS)
+
+    # 向量路输入缺失时用原始查询兜底，保证语义召回能力不因规划缺字段而丢失；
+    # mysql_keywords 为空是合法状态（调用方据此跳过关键词路）
+    if not vector_queries:
+        vector_queries = [query]
+
+    return {
+        "query_type": data["query_type"],
+        "vector_queries": vector_queries,
+        "mysql_keywords": mysql_keywords,
+    }
+
+
+async def plan_search_query(query: str, api_key: str) -> dict:
+    """
+    一次 LLM 调用完成查询规划：判断查询类型（fuzzy/exact）、生成向量改写查询
+    vector_queries、生成 MySQL 关键词 mysql_keywords。
+    LLM 网络失败/超时/返回非法 JSON 时安全降级为原始查询单条向量召回，
+    不中断搜索链路。
     """
     try:
         client = create_client(api_key)
         resp = await client.chat.completions.create(
             model=settings.chat_model,
-            messages=[{
-                "role": "user",
-                "content": f"以下查询是模糊描述还是精确查找？只回答'模糊'或'精确'。\n查询: {query}",
-            }],
-            max_tokens=4,
-            temperature=0,
+            messages=[{"role": "user", "content": _PLAN_PROMPT.format(query=query)}],
+            max_tokens=300,
+            temperature=0.3,
         )
-        raw = resp.choices[0].message.content.strip()
-        return "精确" if "精确" in raw else "模糊"
+        raw = resp.choices[0].message.content or ""
     except Exception:
-        return "模糊"
+        logger.exception("LLM 查询规划调用失败，使用安全降级")
+        return _fallback_plan(query)
+    return _parse_plan(raw, query)
 
 
-async def _rewrite_and_embed(query: str, api_key: str, timing: dict | None = None) -> np.ndarray:
+async def _embed_queries(queries: list[str], api_key: str, fallback_query: str,
+                         timing: dict | None = None) -> np.ndarray:
     """
-    对模糊查询生成 3 个变体，分别 embedding，返回均值向量。
+    对规划出的 vector_queries 逐条 embedding 后取均值并归一化（保留向量合并逻辑）。
+    部分失败时用成功的那部分求均值；全部失败时退回对原始查询单独 embedding。
     """
-    # 生成变体
-    rewrite_started = time.perf_counter()
-    try:
-        client = create_client(api_key)
-        resp = await client.chat.completions.create(
-            model=settings.chat_model,
-            messages=[{"role": "user", "content": _REWRITE_PROMPT.format(query=query)}],
-            max_tokens=100,
-            temperature=0.7,
-        )
-        variants = [v.strip() for v in resp.choices[0].message.content.strip().split("\n") if v.strip()]
-        if not variants:
-            variants = [query]
-    except Exception:
-        variants = [query]
-    if timing is not None:
-        timing["query_rewrite_ms"] = round((time.perf_counter() - rewrite_started) * 1000, 1)
-
-    # 分别 embedding 取均值
-    embedding_started = time.perf_counter()
-    vecs = []
-    for v in variants[:3]:
+    started = time.perf_counter()
+    vecs: list[np.ndarray] = []
+    for q in queries:
         try:
-            emb = await get_embedding(api_key, v)
+            emb = await get_embedding(api_key, q)
             vecs.append(np.array(emb, dtype=np.float32))
         except Exception:
-            pass
+            continue
 
     if not vecs:
-        emb = await get_embedding(api_key, query)
-        if timing is not None:
-            timing["embedding_ms"] = round((time.perf_counter() - embedding_started) * 1000, 1)
-        return np.array(emb, dtype=np.float32)
+        emb = await get_embedding(api_key, fallback_query)
+        vec = np.array(emb, dtype=np.float32)
+    else:
+        vec = l2_normalize(np.mean(vecs, axis=0))
 
     if timing is not None:
-        timing["embedding_ms"] = round((time.perf_counter() - embedding_started) * 1000, 1)
-    avg = np.mean(vecs, axis=0)
-    return l2_normalize(avg)
-
-
-def _extract_keywords(query: str) -> list[str]:
-    """
-    从查询中提取精确锚点关键词。
-    匹配扩展名(.pdf)、日期(2024-03)、版本号(v2.0)、编号(#1024)、英文词。
-    返回去重后的关键词列表。
-    """
-    seen = set()
-    keywords = []
-    for m in _RE_PRECISE.finditer(query):
-        kw = m.group().strip()
-        if kw and kw not in seen:
-            seen.add(kw)
-            keywords.append(kw)
-    return keywords
+        timing["embedding_ms"] = round((time.perf_counter() - started) * 1000, 1)
+    return vec
 
 
 async def _keyword_search(user: str, keywords: list[str], query: str = "",
@@ -938,11 +962,14 @@ async def _rerank_with_llm(query: str, files: list[dict], api_key: str) -> list[
     if len(files) <= 1:
         return files
 
-    # 构建候选列表文本（最多 20 个）
+    # 构建候选列表文本（最多 20 个）：文件名 + 描述 + 匹配上下文 + RRF 分数
     candidates_text = ""
     for i, f in enumerate(files[:20], 1):
         desc = (f.get("description") or "")[:80].replace("\n", " ")
-        candidates_text += f"{i}. 文件名:{f['filename']} | 描述:{desc}\n"
+        ctx = (f.get("match_context") or "")[:40].replace("\n", " ")
+        candidates_text += (
+            f"{i}. 文件名:{f['filename']} | 描述:{desc} | 位置:{ctx} | RRF:{f.get('rrf_score', 0)}\n"
+        )
 
     prompt = _RERANK_PROMPT.format(query=query, candidates=candidates_text)
 
@@ -983,17 +1010,107 @@ async def _rerank_with_llm(query: str, files: list[dict], api_key: str) -> list[
 
 
 # ============================================================
-#  search —— AI 语义搜索（含双路召回 + 去重合并）
+#  search —— AI 语义搜索（一次查询规划 + 双路召回 + 统一 RRF）
 #  独立搜索框与 /ai/search 端点已移除；本引擎由 AI 助手的
 #  search_files 工具调用（agent_tools.tool_search_files）。
 # ============================================================
+
+async def _vector_lookup(user: str, valid: list[tuple[int, float]]) -> dict[str, dict]:
+    """
+    向量路 faiss_id → MySQL 联表批量回查（一次 IN 查询，替代逐 id 单查的 N+1）。
+    返回 md5 → 文件信息（含 vector_rank / 余弦分 / match_context）；
+    同 md5 多 chunk 命中保留最高分。结果取齐即退出会话——后续 RRF 融合与
+    LLM 重排是纯内存/纯网络操作，不应占着连接池连接。
+    """
+    vec_ranked: dict[str, dict] = {}
+    async with Session() as db:
+        db_rows = (await db.execute(
+            select(UserFileAiDesc, UserFileList, FileInfo)
+            .join(UserFileList,
+                  (UserFileList.user == UserFileAiDesc.user) &
+                  (UserFileList.md5 == UserFileAiDesc.md5))
+            .join(FileInfo, FileInfo.md5 == UserFileAiDesc.md5)
+            .where(
+                UserFileAiDesc.user == user,
+                UserFileAiDesc.faiss_id.in_([fid for fid, _ in valid]),
+                UserFileAiDesc.status == 1,
+            )
+        )).all()
+        by_fid = {uad.faiss_id: (uad, ufl, fi) for uad, ufl, fi in db_rows}
+
+        # 只有通过阈值的结果占用名次——被跳过项继续计数会稀释后续项的 RRF 排名
+        rank = 0
+        for fid, score in valid:
+            row = by_fid.get(fid)
+            if not row:
+                continue
+            rank += 1
+            uad, ufl, fi = row
+            md5 = uad.md5
+            if md5 not in vec_ranked or score > vec_ranked[md5]["score"]:
+                vec_ranked[md5] = {
+                    "md5": md5,
+                    "filename": ufl.file_name,
+                    "description": uad.description,
+                    "url": presign_from_db_url(fi.url), "size": str(fi.size), "type": fi.type,
+                    "score": round(score, 4),
+                    "vector_rank": rank,
+                    "match_context": uad.context_label or "",
+                    "chunk_index": uad.chunk_index,
+                }
+    return vec_ranked
+
+
+def _merge_rrf(vec_ranked: dict[str, dict], kw_files: list[dict], k: int = 60) -> list[dict]:
+    """
+    双路统一合并 + RRF 排序（纯内存，无 DB 会话）：
+    - 以 md5 为唯一候选键，vector_rank / keyword_rank 各自可空；
+    - 两路都有 → 1/(k+vector_rank) + 1/(k+keyword_rank)；单路 → 该路贡献；
+    - source 仅作调试与展示，不参与排序；按 rrf_score 降序返回。
+    """
+    candidates: dict[str, dict] = {}
+
+    # 向量路入表
+    for md5, info in vec_ranked.items():
+        info["keyword_rank"] = None
+        info["source"] = "向量路"
+        candidates[md5] = info
+
+    # 关键词路入表 / 合并
+    for rank_j, kf in enumerate(kw_files, start=1):
+        md5 = kf["md5"]
+        cand = candidates.get(md5)
+        if cand is not None:
+            cand["keyword_rank"] = rank_j
+            cand["source"] = "双路混合"
+        else:
+            kf["vector_rank"] = None
+            kf["keyword_rank"] = rank_j
+            kf["description"] = ""
+            kf["match_context"] = ""
+            kf["score"] = 0.0
+            kf["source"] = "关键词路"
+            candidates[md5] = kf
+
+    # 统一 RRF 分数
+    for cand in candidates.values():
+        s = 0.0
+        if cand.get("vector_rank") is not None:
+            s += 1.0 / (k + cand["vector_rank"])
+        if cand.get("keyword_rank") is not None:
+            s += 1.0 / (k + cand["keyword_rank"])
+        cand["rrf_score"] = round(s, 5)
+
+    return sorted(candidates.values(), key=lambda f: f["rrf_score"], reverse=True)
+
 
 async def semantic_search(user: str, query: str, top_k: int = 10,
                           api_key: str | None = None) -> dict:
     """
     语义搜索全链路（全站唯一检索实现）：
-    脏索引自动重建 → 查询特征检测/分类/改写 → FAISS 向量召回 →
-    MySQL 关键词路 → RRF 双路融合 → LLM 重排序。
+    脏索引自动重建 → 一次 LLM 查询规划（类型判断 + 改写 + 关键词生成）→
+    FAISS 向量召回 → MySQL 关键词召回 → 按 md5 合并的统一 RRF 排序 →
+    候选数 >5 时 LLM 重排序。
     返回 {"code": 0, "count": n, "files": [...]} 或 {"code": 1, "msg": ...}
     """
     search_started = time.perf_counter()
@@ -1008,7 +1125,7 @@ async def semantic_search(user: str, query: str, top_k: int = 10,
     if not api_key:
         return {"code": 1, "msg": "AI 服务未配置，请联系管理员"}
 
-    # 脏标记检测 → 自动重建索引（文件删除后触发）
+    # 脏标记检测 → 自动重建索引（文件删除后触发，保持现状）
     dirty_started = time.perf_counter()
     if is_dirty(user):
         try:
@@ -1018,45 +1135,37 @@ async def semantic_search(user: str, query: str, top_k: int = 10,
             pass  # 重建失败不影响搜索，用现存索引继续
     timing["dirty_index_ms"] = round((time.perf_counter() - dirty_started) * 1000, 1)
 
-    keywords = _extract_keywords(query)
+    # ── 一次 LLM 查询规划：类型判断 + 向量改写 + 关键词生成 ──
+    # 查询类型与两路输入完全由 LLM 决定，程序只校验结构后按返回值执行
+    plan_started = time.perf_counter()
+    plan = await plan_search_query(query, api_key)
+    timing["query_plan_ms"] = round((time.perf_counter() - plan_started) * 1000, 1)
+    vector_queries = plan["vector_queries"]
+    keywords = plan["mysql_keywords"]
+
     index_ready = await asyncio.to_thread(get_ntotal, user) > 0
 
     # ── 向量路（索引为空时整体跳过：无向量可搜，也省掉 embedding 调用）──
     results: list[tuple[int, float]] = []
     if index_ready:
-        # ── 查询预处理：特征检测 → 分类 → 改写 ──
-        features = _detect_query_features(query)
-
-        # 结构特征未命中时用 LLM 二次分类
-        classify_started = time.perf_counter()
-        if not features["is_precise"]:
-            qtype = await _classify_query(query, api_key)
-        else:
-            qtype = "精确"
-        timing["query_classify_ms"] = round((time.perf_counter() - classify_started) * 1000, 1)
-
-        # 模糊查询 → 改写 + 均值向量；精确查询 → 原始 embedding
-        if qtype == "模糊":
-            query_vec = await _rewrite_and_embed(query, api_key, timing)
-        else:
-            embedding_started = time.perf_counter()
-            try:
-                embedding = await get_embedding(api_key, query)
-            except RuntimeError as exc:
-                return {"code": 1, "msg": f"embedding failed: {exc}"}
-            query_vec = np.array(embedding, dtype=np.float32)
-            timing["embedding_ms"] = round((time.perf_counter() - embedding_started) * 1000, 1)
+        try:
+            query_vec = await _embed_queries(vector_queries, api_key, query, timing)
+        except RuntimeError as exc:
+            return {"code": 1, "msg": f"embedding failed: {exc}"}
         try:
             faiss_started = time.perf_counter()
             results = await asyncio.to_thread(faiss_search, user, query_vec, top_k)
             timing["faiss_ms"] = round((time.perf_counter() - faiss_started) * 1000, 1)
         except Exception as exc:
             return {"code": 1, "msg": f"faiss search failed: {exc}"}
+    else:
+        timing["embedding_ms"] = 0.0
+        timing["faiss_ms"] = 0.0
 
-    # ── 关键词路 ──
-    # 常规门控：有扩展名/日期/编号等精确锚点才跑。但向量路不可用时
-    # （索引为空：新用户、或尚未对任何文件建立 AI 描述），关键词路是
-    # 唯一可用路径——必须兜底，否则按文件名精确搜索也返回"没有找到"。
+    # ── 关键词路：mysql_keywords 为空即跳过（输入由 LLM 规划给出）──
+    # 向量路不可用时（索引为空：新用户、或尚未对任何文件建立 AI 描述），
+    # 关键词路是唯一可用路径——用原始查询兜底，否则按文件名精确搜索
+    # 也返回"没有找到"。
     if not keywords and not index_ready:
         fallback_kw = query.strip()[:64]
         if fallback_kw:
@@ -1065,102 +1174,34 @@ async def semantic_search(user: str, query: str, top_k: int = 10,
     kw_files = await _keyword_search(user, keywords, query=query, limit=top_k) if keywords else []
     timing["mysql_keyword_ms"] = round((time.perf_counter() - mysql_keyword_started) * 1000, 1)
 
-    # ── faiss_id → MySQL 联表查询（向量路，含 context_label）──
-    # 一次 IN 批量回查（替代逐 id 单查的 N+1），结果取齐即退出会话——
-    # 后续 RRF 融合与 LLM 重排是纯内存/纯网络操作，不应占着连接池连接
-    vec_ranked: dict[str, dict] = {}  # md5 → {file info, rank, vector_score}
+    # ── 向量路候选：faiss_id 批量回查 MySQL（md5 去重取最高分）──
     valid = [(fid, score) for fid, score in results if score >= SCORE_THRESHOLD]
-    if valid:
-        mysql_vector_started = time.perf_counter()
-        async with Session() as db:
-            db_rows = (await db.execute(
-                select(UserFileAiDesc, UserFileList, FileInfo)
-                .join(UserFileList,
-                      (UserFileList.user == UserFileAiDesc.user) &
-                      (UserFileList.md5 == UserFileAiDesc.md5))
-                .join(FileInfo, FileInfo.md5 == UserFileAiDesc.md5)
-                .where(
-                    UserFileAiDesc.user == user,
-                    UserFileAiDesc.faiss_id.in_([fid for fid, _ in valid]),
-                    UserFileAiDesc.status == 1,
-                )
-            )).all()
-            by_fid = {uad.faiss_id: (uad, ufl, fi) for uad, ufl, fi in db_rows}
+    mysql_vector_started = time.perf_counter()
+    vec_ranked = await _vector_lookup(user, valid) if valid else {}
+    timing["mysql_vector_join_ms"] = round((time.perf_counter() - mysql_vector_started) * 1000, 1)
 
-            # 只有通过阈值的结果占用名次——被跳过项继续计数会稀释后续项的 RRF 排名
-            rank = 0
-            for fid, score in valid:
-                row = by_fid.get(fid)
-                if not row:
-                    continue
-                rank += 1
-                uad, ufl, fi = row
-                md5 = uad.md5
-                # 同 md5 多 chunk 命中：保留最高分的那个
-                if md5 not in vec_ranked or score > vec_ranked[md5]["score"]:
-                    vec_ranked[md5] = {
-                        "md5": md5,
-                        "filename": ufl.file_name,
-                        "description": uad.description,
-                        "url": presign_from_db_url(fi.url), "size": str(fi.size), "type": fi.type,
-                        "score": round(score, 4),
-                        "rank": rank,
-                        "match_context": uad.context_label or "",
-                        "chunk_index": uad.chunk_index,
-                    }
-        timing["mysql_vector_join_ms"] = round((time.perf_counter() - mysql_vector_started) * 1000, 1)
-    else:
-        timing["mysql_vector_join_ms"] = 0.0
-
-    # ── RRF 双路排名融合（纯内存计算，无 DB 会话）──
-    K = 60
-    rrf_scores: dict[str, float] = {}
-    file_map: dict[str, dict] = {}
-
-    # 向量路贡献
-    for md5, info in vec_ranked.items():
-        rrf_scores[md5] = 1.0 / (K + info["rank"])
-        info["source"] = "向量路"
-        file_map[md5] = info
-
-    # 关键词路贡献
-    for rank_j, kf in enumerate(kw_files):
-        md5 = kf["md5"]
-        kw_rrf = 1.0 / (K + rank_j + 1)
-        if md5 in rrf_scores:
-            rrf_scores[md5] += kw_rrf
-            file_map[md5]["source"] = "双路混合"
-        else:
-            rrf_scores[md5] = kw_rrf
-            kf["rank"] = rank_j + 1
-            kf["match_context"] = ""
-            kf["source"] = "关键词路"
-            kf["score"] = 0.0
-            file_map[md5] = kf
-
-    # RRF 降序排列
+    # ── 统一合并 + RRF 排序（md5 唯一键；source 仅展示）──
     rrf_started = time.perf_counter()
-    sorted_md5s = sorted(rrf_scores, key=lambda m: rrf_scores[m], reverse=True)
-    files = []
-    for md5 in sorted_md5s:
-        f = file_map[md5]
-        f["rrf_score"] = round(rrf_scores[md5], 5)
-        files.append(f)
+    files = _merge_rrf(vec_ranked, kw_files)
     timing["rrf_ms"] = round((time.perf_counter() - rrf_started) * 1000, 1)
 
-    # ── LLM 重排序（Top-20 → Top-10；秒级 LLM 调用，务必在 DB 会话之外）──
-    if len(files) > 1 and api_key:
+    # ── LLM 重排：候选 ≤5 直接按 RRF 返回（省一次秒级 LLM 调用）；
+    #    >5 取前 20 精排；重排失败回退 RRF 顺序 ──
+    if len(files) > 5:
         rerank_started = time.perf_counter()
         try:
             files = await _rerank_with_llm(query, files[:20], api_key)
         except Exception:
-            pass  # 失败降级：保留 RRF 排名
+            logger.exception("LLM 重排失败，回退统一 RRF 排序")
         timing["llm_rerank_ms"] = round((time.perf_counter() - rerank_started) * 1000, 1)
     else:
         timing["llm_rerank_ms"] = 0.0
 
     timing["total_ms"] = round((time.perf_counter() - search_started) * 1000, 1)
-    logger.info("SEARCH_TIMING user=%s query=%r timing=%s", user, query, timing)
+    logger.info(
+        "SEARCH_TIMING user=%s query=%r qtype=%s vec_q=%d kw=%d timing=%s",
+        user, query, plan["query_type"], len(vector_queries), len(keywords), timing,
+    )
 
     return {"code": 0, "count": len(files), "files": files}
 
