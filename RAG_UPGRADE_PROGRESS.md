@@ -41,17 +41,20 @@
 
 | 项 | 文件 | 状态 |
 |----|------|------|
-| 查询结构特征检测（扩展名/日期/编号/英文词匹配） | `backend/app/routers/ai.py` | ✅ |
-| LLM 查询分类（模糊 vs 精确，约 10 token） | `backend/app/routers/ai.py` | ✅ |
-| LLM 查询改写（模糊查询 → 生成 3 个变体 → 均值向量） | `backend/app/routers/ai.py` | ✅ |
-| 关键词提取函数（正则匹配精确锚点） | `backend/app/routers/ai.py` | ✅ |
-| 关键词路门控（无精确词则跳过） | `backend/app/routers/ai.py` | ✅ |
+| ~~查询结构特征检测（扩展名/日期/编号/英文词匹配）~~ | `backend/app/routers/ai.py` | 🗑️ 已移除（程序不再判断查询类型） |
+| ~~LLM 查询分类（模糊 vs 精确，约 10 token）~~ | `backend/app/routers/ai.py` | 🗑️ 已移除（并入一次查询规划） |
+| ~~LLM 查询改写（模糊查询 → 生成 3 个变体 → 均值向量）~~ | `backend/app/routers/ai.py` | 🔄 由 `plan_search_query` 一次调用完成 |
+| ~~关键词提取函数（正则匹配精确锚点）~~ | `backend/app/routers/ai.py` | 🗑️ 已移除（关键词由 LLM 规划生成） |
+| 一次 LLM 查询规划（query_type + vector_queries + mysql_keywords，结构校验+安全降级） | `backend/app/routers/ai.py` | ✅ |
+| 关键词路门控（mysql_keywords 为空则跳过；索引为空时原始查询兜底） | `backend/app/routers/ai.py` | ✅ |
 | MySQL 关键词搜索（多级排序：命中数 > 完全匹配 > 时间） | `backend/app/routers/ai.py` | ✅ |
-| RRF 双路排名融合 | `backend/app/routers/ai.py` | ✅ |
+| 统一 RRF 候选表（md5 唯一键，vector_rank/keyword_rank/rrf_score） | `backend/app/routers/ai.py` | ✅ |
+| LLM 重排门槛（候选 ≤5 跳过，>5 取前 20 精排，失败回退 RRF） | `backend/app/routers/ai.py` | ✅ |
 | FAISS 搜索适配 chunk（回查时读取 context_label） | `backend/app/routers/ai.py` | ✅ |
 | 按 md5 去重合并（同文件多 chunk 命中取最高分） | `backend/app/routers/ai.py` | ✅ |
-| 结果增加 `match_context` 和 `source` 字段 | `backend/app/routers/ai.py` | ✅ |
+| 结果增加 `match_context` 和 `source` 字段（source 仅展示不参与排序） | `backend/app/routers/ai.py` | ✅ |
 | 验证：模糊查询 / 精确查询 / 混合查询三种场景结果正确 | — | ✅ |
+| 回归测试（规划解析与降级 / RRF 合并 / 重排门槛等 27 用例） | `backend/tests/test_search_pipeline.py` | ✅ |
 
 ---
 
