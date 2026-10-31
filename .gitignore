@@ -39,3 +39,6 @@ docker/nginx_fastdfs/front/
 
 # 测试文档生成产物（testdocs/gen_docs.py 输出，不入库）
 testdocs/out/
+
+# 计时基准原始输出（环境相关，不入库）
+testdocs/bench_*.jsonl
