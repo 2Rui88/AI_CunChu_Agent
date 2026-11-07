@@ -69,6 +69,12 @@ class Settings(BaseSettings):
     # 对话历史已落 MySQL（agent_conversation/agent_message），不再有 Redis TTL
     max_context_messages: int = 20
     max_tool_calls_per_turn: int = 5
+    # read_file 工具（分页读取文本文件；单页结果会进 LLM 上下文并落库，预算须比
+    # extract_char_budget 紧）
+    read_file_default_chars: int = 4000    # 默认页大小（字符）
+    read_file_max_chars: int = 12000       # 单次请求字符上限
+    read_file_min_chars: int = 500         # 页大小钳制下限
+    read_file_slack_bytes: int = 4096      # 行对齐扫描余量（字节）
 
     # ── CORS ──
     # 允许跨域的前端来源（逗号分隔）。生产同源部署（Nginx 同域反代）无需跨域；

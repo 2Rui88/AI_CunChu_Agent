@@ -1,24 +1,26 @@
 """
-Agent 工具集 —— 7 个文件操作工具，供 ReAct Agent Loop 调用
+Agent 工具集 —— 8 个文件操作工具的纯实现，供 ReAct Agent Loop 调用
+
+本模块只放实现；工具的登记（LLM 描述 / 参数 Schema / 危险标记 / 能力
+文案）统一在 tool_registry.py 的一张工具表里，路由层经注册表间接调用。
 
 每个工具函数签名统一为: async def tool_xxx(username: str, **kwargs) -> dict
 - username: 当前用户（由 Agent 注入，非 LLM 参数）
 - kwargs: 来自 LLM function_call 的参数
 
-工具类型:
-  READ:        search_files, get_file_info, list_recent_files,
-               get_storage_stats, describe_file
-  DESTRUCTIVE: delete_file, share_file（需用户二次确认）
-
 注：对话式助手是全站唯一的文件搜索入口——search_files 委托
     ai.semantic_search 全链路（一次 LLM 查询规划 + 双路召回 + 统一 RRF +
     候选>5 时重排），独立的搜索框与 /ai/search 端点已移除。
+    read_file 是 describe_file 的内容侧补位：描述是上传时算好的快照
+    （文本类含前 3 万字符并带截断标记），read_file 按字节偏移分页读
+    MinIO 原文，两者配合覆盖"文件里到底写了什么"类提问。
 """
 import re
 import asyncio
 import logging
 from sqlalchemy import select, delete as sql_delete
 from app.database import Session
+from app.config import settings
 from app.models import (
     UserFileList, FileInfo, UserFileCount,
     ShareFileList, UserFileAiDesc, FileAiDesc,
@@ -26,9 +28,6 @@ from app.models import (
 from app.redis_client import redis
 from app.faiss_service import mark_dirty
 from app.minio_client import client as minio_client, BUCKET, presign_from_db_url
-
-# ── 危险操作集合（Agent 确认门控用）──
-DESTRUCTIVE_TOOLS = {"delete_file", "share_file"}
 
 
 def _compress_description(text: str) -> str:
@@ -271,6 +270,160 @@ async def tool_describe_file(username: str, **kwargs) -> dict:
         return {"error": f"database query failed: {exc}"}
 
 
+# ── read_file 类型门 ──
+# 扩展名白名单：与 ai._TEXT_TYPES 对齐并扩充常见代码/配置类型。
+# PDF/Excel/docx 的提取文本已在 AI 描述中（describe_file 可看），
+# 但原始字节无文本语义，不入白名单；图片/视频/压缩包同理。
+_READABLE_TEXT_TYPES = {
+    "txt", "md", "log", "csv", "tsv", "json", "xml", "yaml", "yml", "toml",
+    "ini", "conf", "cfg", "env", "html", "htm", "css", "js", "ts", "vue",
+    "py", "java", "c", "cpp", "h", "hpp", "go", "rs", "sql", "sh", "bat",
+    "ps1", "rb", "php", "gitignore",
+}
+# 扩展名为 unknown 但按文件名放行的特例（无扩展名文本文件）
+_READABLE_TEXT_NAMES = {"dockerfile", "makefile", "readme", "license"}
+
+
+def _is_readable_text(filename: str) -> bool:
+    """read_file 类型门：扩展名白名单 + 无扩展名文本文件的文件名特例"""
+    if _get_suffix(filename) in _READABLE_TEXT_TYPES:
+        return True
+    return (filename or "").lower() in _READABLE_TEXT_NAMES
+
+
+def _clamp_read_params(offset_raw, length_raw) -> tuple[int, int]:
+    """钳制 LLM 给出的 offset/length（null/负数/超界值就地修正，不抛错）"""
+    try:
+        offset = max(0, int(offset_raw or 0))
+    except (TypeError, ValueError):
+        offset = 0
+    try:
+        length = max(
+            settings.read_file_min_chars,
+            min(int(length_raw or settings.read_file_default_chars),
+                settings.read_file_max_chars),
+        )
+    except (TypeError, ValueError):
+        length = settings.read_file_default_chars
+    return offset, length
+
+
+def _align_and_decode(data: bytes, max_chars: int, at_file_end: bool = False) -> tuple[str, str, int]:
+    """
+    行对齐 + 解码一段原始字节，返回 (文本, 编码, 实际消费字节数)。
+
+    先在 max_chars*4 字节窗口内找最后一个换行截断（UTF-8 最坏一字 4
+    字节），返回内容始终是完整行；整段无换行（超长单行，如压缩过的
+    JS）按窗口上限硬截。at_file_end 表示缓冲已覆盖文件末尾——此时尾
+    部残行就是文件最后一行，直接消费不再对齐截断，避免 eof 被无谓地
+    推迟到下一次调用。硬截可能切在多字节序列中间：退 1~3 字节重试解
+    码；仍失败说明本来就不是 UTF-8，回落 latin-1（与描述管线的
+    _decode_text 策略一致，保证两边读到的内容逐字对齐）。
+    """
+    window = data[:max_chars * 4]
+    nl = window.rfind(b"\n")
+    if at_file_end:
+        consumed = len(window)
+    elif nl >= 0:
+        consumed = nl + 1
+    else:
+        consumed = len(window)
+    chunk = data[:consumed]
+    for drop in range(0, 4):
+        end = consumed - drop
+        if end <= 0:
+            break
+        try:
+            return chunk[:end].decode("utf-8"), "utf-8", end
+        except UnicodeDecodeError:
+            continue
+    return chunk.decode("latin-1"), "latin-1", consumed
+
+
+def _get_object_range(file_id: str, offset: int, length: int) -> bytes:
+    """MinIO 字节范围读（同步阻塞，调用方需 asyncio.to_thread 包裹）"""
+    resp = minio_client.get_object(BUCKET, file_id, offset=offset, length=length)
+    try:
+        return resp.read()
+    finally:
+        resp.close()
+        resp.release_conn()
+
+
+async def tool_read_file(username: str, **kwargs) -> dict:
+    """
+    分页读取文本文件的原始内容（MinIO 字节范围读 + 行对齐）。
+    LLM 参数: identifier (str) — md5 或文件名
+              offset (int, 可选, 默认0) — 起始字节位置
+              length (int, 可选, 默认4000) — 期望读取的字符数
+    响应信封带 next_offset / eof：LLM 抄回 next_offset 续读，eof=true 停。
+    """
+    identifier = kwargs.get("identifier", "")
+    if not identifier:
+        return {"error": "missing identifier"}
+    offset, length = _clamp_read_params(kwargs.get("offset"), kwargs.get("length"))
+
+    try:
+        async with Session() as db:
+            result = await db.execute(
+                select(UserFileList, FileInfo)
+                .join(FileInfo, UserFileList.md5 == FileInfo.md5)
+                .where(
+                    UserFileList.user == username,
+                    (UserFileList.md5 == identifier) |
+                    (UserFileList.file_name == identifier),
+                ).limit(1)
+            )
+            row = result.first()
+            if not row:
+                return {"success": False, "message": f"文件 '{identifier}' 不存在"}
+            ufl, fi = row
+
+            # 类型门：白名单外零下载成本拒绝，指路 describe_file
+            if not _is_readable_text(ufl.file_name):
+                return {
+                    "success": False,
+                    "reason": "unsupported_type",
+                    "filename": ufl.file_name,
+                    "type": fi.type or _get_suffix(ufl.file_name),
+                    "message": "该文件类型无文本内容，可调用 describe_file 查看其 AI 描述",
+                }
+
+            size = int(fi.size or 0)
+            if size == 0:
+                return {"success": True, "md5": ufl.md5, "filename": ufl.file_name,
+                        "size": 0, "offset": 0, "content": "", "chars": 0,
+                        "next_offset": None, "eof": True, "encoding": "utf-8"}
+            if offset >= size:
+                return {"success": False, "filename": ufl.file_name,
+                        "size": size,
+                        "message": f"offset={offset} 已超出文件末尾（size={size}）"}
+
+            # 字节范围读：×4 覆盖 UTF-8 最坏情况，+slack 供行对齐扫描
+            fetch_len = min(length * 4 + settings.read_file_slack_bytes, size - offset)
+            data = await asyncio.to_thread(_get_object_range, fi.file_id, offset, fetch_len)
+
+        content, encoding, consumed = _align_and_decode(
+            data, length, at_file_end=offset + len(data) >= size,
+        )
+        next_offset = offset + consumed
+        eof = next_offset >= size
+        return {
+            "success": True,
+            "md5": ufl.md5,
+            "filename": ufl.file_name,
+            "size": size,
+            "offset": offset,
+            "content": content,
+            "chars": len(content),
+            "next_offset": None if eof else next_offset,
+            "eof": eof,
+            "encoding": encoding,
+        }
+    except Exception as exc:
+        return {"error": f"read file failed: {exc}"}
+
+
 # ============================================================
 #  DESTRUCTIVE 工具（需用户确认）
 # ============================================================
@@ -449,16 +602,3 @@ async def tool_share_file(username: str, **kwargs) -> dict:
 
     return {"success": True, "md5": ufl.md5, "filename": ufl.file_name,
             "message": f"文件 '{ufl.file_name}' 已分享到共享广场"}
-
-
-# ── 工具注册表 ──
-
-TOOLS = {
-    "search_files": tool_search_files,
-    "get_file_info": tool_get_file_info,
-    "list_recent_files": tool_list_recent_files,
-    "get_storage_stats": tool_get_storage_stats,
-    "describe_file": tool_describe_file,
-    "delete_file": tool_delete_file,
-    "share_file": tool_share_file,
-}

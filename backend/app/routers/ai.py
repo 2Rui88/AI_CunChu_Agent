@@ -21,7 +21,7 @@ import logging
 import zipfile
 import fitz  # PyMuPDF
 import openpyxl
-from app.chunker import chunk_text, Chunk
+from app.chunker import chunk_text
 import numpy as np
 import httpx
 from fastapi import APIRouter
@@ -356,9 +356,12 @@ async def _generate_description(db, md5_val: str, filename: str, file_type: str,
         fi = result.scalar()
         if fi and fi.url:
             internal_url = _build_internal_url(fi.url)
-            content, err = await _download_and_extract(internal_url, ft, cap)
+            content, encoding, err = await _download_and_extract(internal_url, ft, cap)
             if content:
-                return _format_text_description(filename, content), None, False
+                # docx 提取文本与原始字节无对应关系，标记中不给 read_file 续读偏移
+                return _format_text_description(
+                    filename, content, encoding, allow_read_file=ft in _TEXT_TYPES,
+                ), None, False
             if err:
                 return _make_stub_description(ft, filename, fi.size, err), None, True
 
@@ -376,24 +379,25 @@ _TEXT_TYPES = {
 }
 
 
-async def _download_and_extract(file_url: str, file_type: str, cap_bytes: int) -> tuple[str | None, str | None]:
+async def _download_and_extract(file_url: str, file_type: str, cap_bytes: int) -> tuple[str | None, str | None, str | None]:
     """
     下载文本/docx 文件并提取文本。
-    返回 (文本, 失败原因|None)——失败原因为 _TOO_LARGE_MSG / _EXTRACT_FAIL_MSG，
+    返回 (文本, 编码名|None, 失败原因|None)——编码供描述截断标记换算
+    续读字节偏移；失败原因为 _TOO_LARGE_MSG / _EXTRACT_FAIL_MSG，
     调用方据此生成降级存根。
     """
     try:
         data = await _download_capped(file_url, cap_bytes)
     except _DownloadTooLarge:
-        return None, _TOO_LARGE_MSG
+        return None, None, _TOO_LARGE_MSG
     except RuntimeError:
-        return None, _EXTRACT_FAIL_MSG
+        return None, None, _EXTRACT_FAIL_MSG
 
     if file_type == "docx":
         text = await asyncio.to_thread(_parse_docx, data)
-    else:
-        text = await asyncio.to_thread(_decode_text, data)
-    return text, None  # text 为 None 表示解析不出内容，由调用方走原兜底
+        return text, None, None  # docx 提取文本与原始字节无对应，不携带编码
+    text, encoding = await asyncio.to_thread(_decode_text, data)
+    return text, encoding, None  # text 为 None 表示解析不出内容，由调用方走原兜底底
 
 
 def _parse_docx(data: bytes) -> str | None:
@@ -410,7 +414,7 @@ def _parse_docx(data: bytes) -> str | None:
     except Exception:
         return None
 
-    xml_text = _decode_text(xml_bytes)
+    xml_text, _ = _decode_text(xml_bytes)
     if not xml_text:
         return None
 
@@ -424,21 +428,41 @@ def _parse_docx(data: bytes) -> str | None:
     return text if text else None
 
 
-def _decode_text(data: bytes) -> str | None:
-    """尝试 UTF-8 解码，失败则用 latin-1 兜底"""
+def _decode_text(data: bytes) -> tuple[str | None, str | None]:
+    """尝试 UTF-8 解码，失败则用 latin-1 兜底。返回 (文本, 编码名|None)。
+
+    编码名供调用方换算字节偏移：read_file 的 offset 是字节语义，描述截断
+    标记需要给出精确续读位置（utf-8 取截断前缀的编码字节数，latin-1
+    一字符一字节）。
+    """
     try:
-        return data.decode("utf-8")
+        return data.decode("utf-8"), "utf-8"
     except UnicodeDecodeError:
         try:
-            return data.decode("latin-1")
+            return data.decode("latin-1"), "latin-1"
         except Exception:
-            return None
+            return None, None
 
 
-def _format_text_description(filename: str, content: str) -> str:
-    """格式化文本/文档描述：文件名 + 内容（截断到统一字符预算）"""
+def _format_text_description(filename: str, content: str, encoding: str | None = None,
+                             allow_read_file: bool = True) -> str:
+    """格式化文本/文档描述：文件名 + 内容（截断到统一字符预算）。
+
+    超过预算时追加截断标记，消除"前 3 万字符被 LLM 当作全文"的静默截断：
+    文本类文件内嵌续读字节偏移（read_file 的 offset 语义，按实际编码精确
+    换算）；docx 的提取文本与原始字节无对应关系，只标注截断不给偏移。
+    """
     budget = settings.extract_char_budget
-    return f"文件名：{filename}\n文件内容：{content[:budget]}"
+    if len(content) <= budget:
+        return f"文件名：{filename}\n文件内容：{content}"
+    prefix = content[:budget]
+    if allow_read_file:
+        byte_offset = len(prefix) if encoding == "latin-1" else len(prefix.encode("utf-8"))
+        marker = (f"\n[注：以上为文件前 {budget} 字符，全文共 {len(content)} 字符，"
+                  f"续读请调用 read_file 并传 offset={byte_offset}]")
+    else:
+        marker = f"\n[注：以上为文件前 {budget} 字符，全文共 {len(content)} 字符]"
+    return f"文件名：{filename}\n文件内容：{prefix}{marker}"
 
 
 # ── PDF 文本提取 ──

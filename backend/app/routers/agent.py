@@ -21,23 +21,21 @@ from app.database import Session
 from app.models import AgentConversation, AgentMessage, UserFileList
 from app.dependencies import check_token
 from app.redis_client import redis
-from app.agent_tools import TOOLS, DESTRUCTIVE_TOOLS
+from app.tool_registry import (
+    abilities_section, get_tool, is_destructive, tool_definitions,
+)
 from app.minio_client import presign_url, BUCKET
 from app.dashscope_client import create_client
 
 router = APIRouter(prefix="/api/agent", tags=["agent"])
 
 # ── 系统提示词 ──
-SYSTEM_PROMPT = """你是 AI云存储 的文件管理助手，也是用户查找文件的唯一入口。你可以帮助用户搜索和管理他们的文件。
+# "你的能力"列表由工具注册表生成（abilities_section），与 tool_registry
+# 的登记表自动同步；规则区是跨工具的行为约定，仍手工维护。
+SYSTEM_PROMPT = f"""你是 AI云存储 的文件管理助手，也是用户查找文件的唯一入口。你可以帮助用户搜索和管理他们的文件。
 
 你的能力:
-- 语义搜索文件（search_files，全链路：查询规划 + 双路召回 + 统一排序）
-- 查看文件详细信息（get_file_info）
-- 列出最近上传的文件（list_recent_files）
-- 查看存储统计（get_storage_stats）
-- 获取文件的 AI 内容描述（describe_file）
-- 分享文件到共享广场（share_file）—— 需要用户确认
-- 删除文件（delete_file）—— 需要用户确认
+{abilities_section()}
 
 规则:
 - 用户想找文件时，优先使用 search_files，不需要引导他去别处
@@ -46,6 +44,9 @@ SYSTEM_PROMPT = """你是 AI云存储 的文件管理助手，也是用户查找
 - 回答要简洁，引用具体文件名和细节
 - 引用文件时，用 Markdown 链接格式 [文件名](URL) 附带下载链接，URL 必须原样使用工具结果中给出的链接，不得改写、缩写或省略问号后的任何参数
 - 如果搜索结果有 match_context，用它标注文件中的具体位置
+- 回答"文件里写了什么"类问题时，先用 read_file 读原文，不要凭 AI 描述推测
+- 描述中标注了截断时，按标注中给出的 offset 调用 read_file 继续读取
+- 工具预算读不完时，基于已读内容作答，并说明已读到文件大约百分之多少
 - 如果搜索无结果，建议用户尝试不同的描述词
 - 始终使用中文回复"""
 
@@ -160,60 +161,6 @@ async def _wait_confirmation(token: str, timeout: int) -> str:
                 return decision
         await asyncio.sleep(CONFIRM_POLL_INTERVAL)
     return "timeout"
-
-
-# ── 工具定义（OpenAI function calling 格式）──
-def _tool_definitions() -> list[dict]:
-    return [
-        {"type": "function", "function": {
-            "name": "search_files",
-            "description": "语义搜索用户文件（全站唯一搜索入口，自然语言描述即可）",
-            "parameters": {"type": "object", "properties": {
-                "query": {"type": "string", "description": "搜索关键词或自然语言描述"},
-                "top_k": {"type": "integer", "description": "返回数量(默认5)", "default": 5},
-            }, "required": ["query"]},
-        }},
-        {"type": "function", "function": {
-            "name": "get_file_info",
-            "description": "获取文件详细信息",
-            "parameters": {"type": "object", "properties": {
-                "identifier": {"type": "string", "description": "文件MD5或文件名"},
-            }, "required": ["identifier"]},
-        }},
-        {"type": "function", "function": {
-            "name": "list_recent_files",
-            "description": "列出最近上传的文件",
-            "parameters": {"type": "object", "properties": {
-                "count": {"type": "integer", "description": "数量(默认10)", "default": 10},
-            }},
-        }},
-        {"type": "function", "function": {
-            "name": "get_storage_stats",
-            "description": "查看存储统计",
-            "parameters": {"type": "object", "properties": {}},
-        }},
-        {"type": "function", "function": {
-            "name": "describe_file",
-            "description": "获取文件的AI内容描述",
-            "parameters": {"type": "object", "properties": {
-                "identifier": {"type": "string", "description": "文件MD5或文件名"},
-            }, "required": ["identifier"]},
-        }},
-        {"type": "function", "function": {
-            "name": "delete_file",
-            "description": "删除文件（需用户确认）",
-            "parameters": {"type": "object", "properties": {
-                "identifier": {"type": "string", "description": "文件MD5或文件名"},
-            }, "required": ["identifier"]},
-        }},
-        {"type": "function", "function": {
-            "name": "share_file",
-            "description": "分享文件到共享广场（需用户确认）",
-            "parameters": {"type": "object", "properties": {
-                "identifier": {"type": "string", "description": "文件MD5或文件名"},
-            }, "required": ["identifier"]},
-        }},
-    ]
 
 
 class ChatRequest(BaseModel):
@@ -462,7 +409,7 @@ async def agent_chat(body: ChatRequest):
                     stream = await client.chat.completions.create(
                         model=settings.chat_model,
                         messages=messages,
-                        tools=_tool_definitions(),
+                        tools=tool_definitions(),
                         tool_choice="auto",
                         stream=True,
                     )
@@ -532,16 +479,16 @@ async def agent_chat(body: ChatRequest):
                     yield await _sse("tool_call", {"name": name, "arguments": args})
 
                     # 危险操作确认门控
-                    if name in DESTRUCTIVE_TOOLS:
+                    if is_destructive(name):
                         confirm_token = str(uuid.uuid4())
                         await _create_confirmation(confirm_token, body.user, name)
 
-                        # 获取文件信息用于展示
+                        # 获取文件信息用于展示（经注册表间接调用，不直连实现模块）
                         file_info = {}
                         identifier = args.get("identifier", "")
                         try:
-                            from app.agent_tools import tool_get_file_info
-                            info = await tool_get_file_info(body.user, identifier=identifier)
+                            info_spec = get_tool("get_file_info")
+                            info = await info_spec.handler(body.user, identifier=identifier)
                             if info.get("found"):
                                 file_info = {"filename": info["filename"], "size": str(info.get("size", "")),
                                              "type": info.get("type", "")}
@@ -566,11 +513,11 @@ async def agent_chat(body: ChatRequest):
                             yield await _sse("tool_result", {"name": name, "result": result})
                             continue
 
-                    # 执行工具（密钥由服务端配置提供，不经过 LLM 参数）
-                    handler = TOOLS.get(name)
-                    if handler:
+                    # 执行工具（经注册表定位 handler；密钥由服务端配置提供，不经过 LLM 参数）
+                    spec = get_tool(name)
+                    if spec:
                         try:
-                            result = await handler(body.user, **args)
+                            result = await spec.handler(body.user, **args)
                             tool_count += 1
                         except Exception as exc:
                             result = {"error": f"工具执行失败: {exc}"}
