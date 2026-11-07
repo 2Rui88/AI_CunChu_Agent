@@ -76,6 +76,25 @@ class Settings(BaseSettings):
     read_file_min_chars: int = 500         # 页大小钳制下限
     read_file_slack_bytes: int = 4096      # 行对齐扫描余量（字节）
 
+    # ── 向量化任务队列（indexing_jobs）──
+    # 上传只投递任务立即返回；重活（下载/提取/描述/向量化）由后台消费者执行。
+    # 全局消费并发 = 后端进程数 × indexing_concurrency（原子领取保证多消费者安全）
+    indexing_concurrency: int = 1            # 单进程同时处理的任务数
+    indexing_poll_seconds: float = 2.0       # 队列空时的轮询间隔（秒）
+    indexing_job_timeout_seconds: int = 900  # running 超时视为消费者崩溃，回收重投
+    indexing_max_attempts: int = 3           # 失败自动重试上限（含首次执行）
+
+    # ── DashScope 全局并发闸门（跨进程，Redis ZSET 计数）──
+    # 共享 API Key 的保护层：embedding/chat/vl 各自限并行，超出排队；
+    # 429/网络抖动按指数退避重试。进程内信号量只能管单进程，这里必须跨进程
+    gate_embedding_limit: int = 5            # embedding 并行上限
+    gate_chat_limit: int = 3                 # chat / 查询规划 / 重排并行上限
+    gate_vl_limit: int = 3                   # VL 图片描述并行上限
+    gate_lease_seconds: int = 300            # 闸门持有兜底 TTL（持有者崩溃后自动放行）
+    gate_wait_seconds: int = 20              # 闸门内最长排队等待，超时快速失败
+    gate_backoff_attempts: int = 3           # 可重试错误的退避重试次数
+    gate_backoff_base_seconds: float = 1.0   # 指数退避基数（1s/2s/4s + 抖动）
+
     # ── CORS ──
     # 允许跨域的前端来源（逗号分隔）。生产同源部署（Nginx 同域反代）无需跨域；
     # 默认放行本地开发常用地址，正式环境用环境变量 CORS_ORIGINS 覆盖。
