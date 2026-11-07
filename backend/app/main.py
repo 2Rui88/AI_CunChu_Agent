@@ -3,8 +3,9 @@ from contextlib import asynccontextmanager
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from app.config import settings
-from app.routers import auth, files, chunk, share, ai, agent, vector_docs
+from app.routers import auth, files, chunk, share, ai, agent, vector_docs, indexing
 from app.database import init_db
+from app.indexing.worker import start_worker, stop_worker
 from app.minio_client import ensure_bucket
 
 logger = logging.getLogger("uvicorn.error")
@@ -19,7 +20,10 @@ async def lifespan(app: FastAPI):
     except Exception as exc:
         logger.error("startup init failed: %s", exc)
         raise
+    # 向量化任务消费循环：每进程一份，多 worker 部署时原子领取保证安全
+    start_worker()
     yield
+    await stop_worker()
 
 
 app = FastAPI(title="AI-YunCunChu", lifespan=lifespan)
@@ -40,6 +44,7 @@ app.include_router(share.router)
 app.include_router(ai.router)
 app.include_router(agent.router)
 app.include_router(vector_docs.router)
+app.include_router(indexing.router)
 
 
 @app.get("/api/health")

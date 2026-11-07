@@ -27,7 +27,7 @@ from app.agent_tools import (
     _align_and_decode, _clamp_read_params, _is_readable_text,
     tool_read_file,
 )
-from app.routers.ai import _decode_text, _format_text_description
+from app.indexing.pipeline import _decode_text, _format_text_description
 
 
 # ── 1-5 行对齐与解码 ──
