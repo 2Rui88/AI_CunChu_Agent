@@ -10,7 +10,7 @@ import styled from '@emotion/styled';
 import { API_CONFIG } from '../config';
 import { useAuth } from '../contexts/AuthContext';
 import { fetchUserImages, uploadImage, deleteImage, shareFile, cancelShareFile } from '../services/images';
-import { describeFileByMd5 } from '../services/ai';
+import { describeFileByMd5, waitIndexingDone } from '../services/ai';
 import { IMAGE_EXTS, formatFileSize, getFileIcon } from '../utils/format';
 
 const UploadCard = styled(Card)`
@@ -189,17 +189,24 @@ const FileList = () => {
       cancelText: '取消',
       onOk: async () => {
         const msgKey = 'buildIndex';
-        message.loading({ content: '正在提取内容并建立索引...', key: msgKey, duration: 0 });
         try {
-          await describeFileByMd5(record.md5, record.file_name, record.type, user);
-          message.success({ content: '内容索引已建立，现在可以按内容搜索该文件', key: msgKey });
+          // 异步任务链路：投递立即返回，轮询状态直到终态（后端不再同步等待）
+          await describeFileByMd5(record.md5, record.file_name, record.type, user, { force: true });
+          message.loading({ content: '已提交，后台正在提取内容并建立索引...', key: msgKey, duration: 0 });
+          const job = await waitIndexingDone(record.md5, user);
+          if (job.status === 'failed') {
+            message.warning({ content: `索引建立失败：${job.error || '原因未知'}，可稍后重试`, key: msgKey });
+          } else {
+            message.success({ content: '内容索引已建立，现在可以按内容搜索该文件', key: msgKey });
+            fetchFiles();
+          }
         } catch (err) {
           if (err.tokenExpired) {
             message.destroy(msgKey);
             logout();
             return;
           }
-          message.error({ content: err.message || '建立失败', key: msgKey });
+          message.warning({ content: err.message || '建立失败', key: msgKey, duration: 6 });
         }
       },
     });

@@ -19,8 +19,9 @@
 
 ```
 上传 "2025年度技术方案.docx"
-  → 系统自动提取内容，按章节分块
-  → 逐块生成 768 维向量，存入 FAISS 索引
+  → 系统投递一个向量化任务（indexing_jobs 表）并立即返回
+  → 后台消费者异步完成：提取内容 → 智能分块 → 逐块生成 768 维向量 → 存入 FAISS 索引
+  → 全程经 DashScope 全局并发闸门（跨进程限流 + 429 指数退避），失败自动重试
 
 三个月后，你在 AI 助手对话中输入: "帮我看一下那个关于微服务架构的方案"
   → 一次 LLM 查询规划：判断模糊/精确，生成改写查询与文件名关键词
@@ -62,10 +63,13 @@
 
 ### AI 文件理解
 
+- **异步向量化任务队列**：上传只向 `indexing_jobs` 表投递任务并立即返回，下载/提取/描述/向量化由后台消费者异步执行（`app/indexing` 包）；多用户上传高峰不再占用 HTTP 请求，任务失败自动重试（默认 3 次），消费者崩溃由超时回收兜底
+- **公平调度**：多消费者原子领取（条件 UPDATE 抢占，多进程安全），优先服务"当前在跑任务最少"的用户，防单个大文件队列饿死其他用户
 - **多模态描述**：图片上传后调用 Qwen-VL 生成中文描述，文本文件直接提取内容
 - **多格式解析**：PDF（逐页提取+字号检测）、Excel（按工作表+行解析）、Word（解压 XML 提取）、Markdown（标题识别）、代码（函数/类声明识别）
 - **自适应分块**：按文件结构切分——Markdown 按 `##` 标题、代码按函数声明、PDF 按页面、Excel 按工作表，每个切片保留上下文标签
 - **两级缓存**：`file_ai_desc` 全局缓存（跨用户复用）+ `user_file_ai_desc` 用户记录，同一文件只需一次 AI 调用
+- **AI 调用全局限流与用量记账**：DashScope embedding / VL / chat 各自经跨进程并发闸门（Redis ZSET 信号量，多 worker 共享上限），限流与网络抖动指数退避；`ai_usage_log` 按用户记录调用次数与 token，为配额/成本核算积累数据
 - **密钥统一管理**：API Key 仅由部署者配置在环境变量 `DASHSCOPE_API_KEY`，所有用户复用；不落库、不下发前端、不出现在任何响应中
 
 ### AI 语义搜索
@@ -113,6 +117,7 @@
 
 ### 维护与一致性
 
+- **任务队列自愈**：pending 行即队列（原子 UPDATE 领取），running 超时（默认 15 分钟）自动回收重投，失败重试默认 3 次后转为可观察的 failed（手动重建入口兜底）
 - **脏标记自动重建**：文件删除后标记 dirty，下次搜索前自动从 MySQL 全量重建 FAISS 索引
 - **文件锁并发控制**：防止多个搜索请求同时触发重建；add_vector/rebuild 均持用户级文件锁（跨 worker 串行化），索引落盘为原子替换
 
@@ -145,6 +150,7 @@ docker exec -i tc_mysql mysql -uroot -p"$MYSQL_ROOT_PASSWORD" yuncunchu < mysql/
 docker exec -i tc_mysql mysql -uroot -p"$MYSQL_ROOT_PASSWORD" yuncunchu < mysql/migration_chunk.sql
 docker exec -i tc_mysql mysql -uroot -p"$MYSQL_ROOT_PASSWORD" yuncunchu < mysql/migration_share_unique.sql
 docker exec -i tc_mysql mysql -uroot -p"$MYSQL_ROOT_PASSWORD" yuncunchu < mysql/migration_drop_apikey.sql
+docker exec -i tc_mysql mysql -uroot -p"$MYSQL_ROOT_PASSWORD" yuncunchu < mysql/migration_indexing_jobs.sql
 
 # 5. 访问
 open https://localhost
