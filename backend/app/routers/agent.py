@@ -21,6 +21,8 @@ from app.database import Session
 from app.models import AgentConversation, AgentMessage, UserFileList
 from app.dependencies import check_token
 from app.redis_client import redis
+from app.ai_usage import KIND_CHAT, make_row, write_usage
+from app.ratelimit import GATE_CHAT, Gate, RetryableError, call_with_backoff
 from app.tool_registry import (
     abilities_section, get_tool, is_destructive, tool_definitions,
 )
@@ -335,6 +337,50 @@ def _spawn_persist(conv_id: int, msgs: list[dict], resign_user: str = "") -> Non
     task.add_done_callback(_bg_persist_tasks.discard)
 
 
+async def _create_chat_stream(client, messages: list[dict]):
+    """在 chat 闸门内创建流式对话调用（跨进程共享 API Key 的并发保护）。
+
+    限流（RateLimitError）转可重试错误后指数退避，仅覆盖 create 阶段——
+    流开始后的中断不重试：重放会把已下发给用户的增量再发一遍。
+    """
+    import openai
+
+    async def _create():
+        try:
+            return await client.chat.completions.create(
+                model=settings.chat_model,
+                messages=messages,
+                tools=tool_definitions(),
+                tool_choice="auto",
+                stream=True,
+            )
+        except openai.RateLimitError as exc:
+            raise RetryableError(f"chat throttled: {exc}") from exc
+
+    async with Gate(GATE_CHAT):
+        return await call_with_backoff(_create)
+
+
+async def _persist_tail(conv_id: int, msgs: list[dict], resign_user: str = "") -> None:
+    """
+    终局存档：优先直接 await 完成（正常结束/异常路径都同步落库，消除
+    Gunicorn 周期回收 worker 时后台任务被杀的丢失窗口）；仅当协程已被
+    取消（客户端断开）才退回独立后台任务——此时继续 await 会立刻抛
+    CancelledError，只有同步 create_task 能把存档挂出去执行。
+    """
+    try:
+        if resign_user:
+            # 半截文本未经收尾重签；此处补签保证历史会话里的链接可点
+            for m in msgs:
+                if m.get("role") == "assistant" and m.get("content"):
+                    m["content"] = await _resign_dl_links(resign_user, m["content"])
+        await _persist_messages(conv_id, msgs)
+    except (asyncio.CancelledError, Exception):
+        # 取消（不能再 await）或落库自身失败：兜底甩后台任务；
+        # 仍失败则容忍丢失（提问已先落库，用户重问即可），日志留痕在 _run 内
+        _spawn_persist(conv_id, msgs, resign_user=resign_user)
+
+
 def _build_llm_context(history: list[dict], new_user_message: dict) -> list[dict]:
     """system + 截断历史 + 本条用户消息。
 
@@ -381,6 +427,8 @@ async def agent_chat(body: ChatRequest):
         # 复用全局缓存客户端（httpx 连接池进程内共享）；每请求新建会泄漏连接
         client = create_client(settings.dashscope_api_key)
         tool_count = 0
+        usage_tokens = 0         # 本轮 LLM token 累计（流末尾 usage 块，未返回则记 0）
+        llm_calls = 0            # 本轮 LLM 调用次数（usage 缺失时至少有次数可审计）
         base = len(messages)        # 本轮 assistant/tool 消息的追加起点
         committed = base            # 已落库的消息下标（分步提交的安全边界）
         streamed_text = ""          # 本轮已流式下发、尚未定稿进 messages 的文本
@@ -406,17 +454,16 @@ async def agent_chat(body: ChatRequest):
                 text = ""                    # 本轮累计文本（落库/重签用）
                 calls: dict[int, dict] = {}  # index -> {id, name, arguments}
                 try:
-                    stream = await client.chat.completions.create(
-                        model=settings.chat_model,
-                        messages=messages,
-                        tools=tool_definitions(),
-                        tool_choice="auto",
-                        stream=True,
-                    )
+                    stream = await _create_chat_stream(client, messages)
+                    llm_calls += 1
                     async with stream:  # 断开/异常时确定性关闭上游连接
                         async for chunk in stream:
+                            if getattr(chunk, "usage", None):
+                                # 流末尾的 usage 块（choices 为空）：累计 token
+                                usage_tokens += (chunk.usage.prompt_tokens or 0) \
+                                    + (chunk.usage.completion_tokens or 0)
                             if not chunk.choices:
-                                continue  # 流末尾的 usage 等空 choices 块
+                                continue  # 其余空 choices 块
                             d = chunk.choices[0].delta
                             if d is None:
                                 continue
@@ -541,11 +588,21 @@ async def agent_chat(body: ChatRequest):
             logging.getLogger("uvicorn.error").exception("agent/chat 未捕获异常")
             yield await _sse("error", {"message": str(exc)})
         finally:
-            # 中断/异常兜底存档。客户端断开导致生成器被取消时 finally 里不能再
-            # await，存档甩成独立任务挂在事件循环上自行跑完。只存"安全前缀"——
-            # 收尾不完整的一轮（tool_calls 缺 tool 回应）整段丢弃；已流式给用户
-            # 看过、尚未定稿进 messages 的半截文本单独补存。_persist_messages 单
-            # 事务失败即整体回滚，与分步提交的批次不会产生重复消息。
+            # 用量记账：正常路径 await 完成；协程已取消时跳过（记账可失，
+            # 消息存档优先）。write_usage 自身失败已留痕，这里不再连坐。
+            try:
+                if llm_calls:
+                    await write_usage([make_row(
+                        body.user, KIND_CHAT, settings.chat_model,
+                        tokens=usage_tokens, calls=llm_calls,
+                    )])
+            except (asyncio.CancelledError, Exception):
+                pass
+
+            # 中断/异常兜底存档。只存"安全前缀"——收尾不完整的一轮
+            # （tool_calls 缺 tool 回应）整段丢弃；已流式给用户看过、尚未定稿
+            # 进 messages 的半截文本单独补存。_persist_messages 单事务失败即
+            # 整体回滚，与分步提交的批次不会产生重复消息。
             if committed < len(messages) or streamed_text:
                 msgs = _safe_prefix(messages[committed:])
                 if streamed_text and not any(
@@ -554,7 +611,7 @@ async def agent_chat(body: ChatRequest):
                 ):
                     msgs.append({"role": "assistant", "content": streamed_text})
                 if msgs:
-                    _spawn_persist(conv.id, msgs, resign_user=body.user)
+                    await _persist_tail(conv.id, msgs, body.user)
 
     return EventSourceResponse(event_generator())
 
