@@ -9,7 +9,6 @@
 防单个大用户的大文件队列饿死其他用户。
 """
 import logging
-from datetime import datetime, timedelta
 
 from sqlalchemy import select, text
 
@@ -90,7 +89,12 @@ async def enqueue(db, *, md5: str, user: str, filename: str, file_type: str,
 
 
 async def claim_next(db, worker_id: str) -> IndexingJob | None:
-    """公平领取一个 pending：条件 UPDATE 抢占，被抢走则换下一行（最多 3 个候选）"""
+    """公平领取一个 pending：条件 UPDATE 抢占，被抢走则换下一行（最多 3 个候选）。
+
+    UPDATE 后必须显式 commit——async with Session() 退出只 close（回滚未提交
+    事务）；不提交的话 DB 里任务仍是 pending，每个进程每轮都会重复领取，
+    造成多进程并发执行同一任务（唯一键冲突 / 重复消耗 API 调用）。
+    """
     candidate_ids = (await db.execute(_PICK_SQL)).scalars().all()
     for jid in candidate_ids:
         result = await db.execute(
@@ -101,6 +105,7 @@ async def claim_next(db, worker_id: str) -> IndexingJob | None:
             {"w": worker_id, "id": jid},
         )
         if result.rowcount == 1:
+            await db.commit()  # 抢占立即提交生效，其他消费者立刻不可见
             return (await db.execute(
                 select(IndexingJob).where(IndexingJob.id == jid)
             )).scalar()
@@ -111,16 +116,20 @@ async def reclaim_stale(db) -> int:
     """
     回收超时 running（消费者崩溃/被杀）：attempts 未超上限 → 回 pending 重投；
     已超上限 → failed（可观察终态，等待手动重建）。返回回收行数。
+
+    超时判定必须用数据库侧 NOW()：started_at 由 claim 时的 MySQL NOW() 写入，
+    若在 Python 侧生成 UTC 时间比较（MySQL 会话时区为 +08:00），会把刚领取
+    的任务全部误判为超时，引发多进程重复执行同一任务。
     """
-    cutoff = datetime.utcnow() - timedelta(seconds=settings.indexing_job_timeout_seconds)
     result = await db.execute(
         text(
             "UPDATE indexing_jobs SET status=IF(attempts < :maxa, 'pending', 'failed'), "
             "error='job timed out', worker='', "
             "finished_at=IF(attempts >= :maxa, NOW(), finished_at) "
-            "WHERE status='running' AND started_at < :cutoff"
+            "WHERE status='running' AND started_at < NOW() - INTERVAL :timeout SECOND"
         ),
-        {"maxa": settings.indexing_max_attempts, "cutoff": cutoff},
+        {"maxa": settings.indexing_max_attempts,
+         "timeout": settings.indexing_job_timeout_seconds},
     )
     await db.commit()
     if result.rowcount:

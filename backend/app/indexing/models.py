@@ -44,12 +44,12 @@ class IndexingJob(Base):
     )
 
     def public_dict(self) -> dict:
-        """对外状态视图（不含内部字段）"""
+        """对外状态视图（仅消费方实际使用的字段；不读 create_time 等
+        server_default 列——新建对象上访问未加载属性会触发同步惰性
+        加载，在 async 环境直接抛 MissingGreenlet）"""
         return {
             "md5": self.md5,
             "status": self.status,
             "attempts": self.attempts,
             "error": self.error or "",
-            "create_time": str(self.create_time or ""),
-            "finished_at": str(self.finished_at or ""),
         }
