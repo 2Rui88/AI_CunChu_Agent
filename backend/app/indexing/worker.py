@@ -38,7 +38,18 @@ _worker_task: asyncio.Task | None = None
 # 在途执行协程：持有引用防 GC 中途回收；stop_worker 据此优雅排空
 _inflight: set[asyncio.Task] = set()
 
-_worker_id = f"{socket.gethostname()}:{os.getpid()}"
+# 惰性计算：gunicorn preload_app 下模块在 master 进程导入，fork 前取到的
+# pid 是 master 的——所有 worker 会共享同一标识，租约的持有者条件化与
+# active_workers 统计随之退化。首次使用发生在各 worker 自己的事件循环里
+# （lifespan → _run_loop），此时 pid 才真实。
+_worker_id: str | None = None
+
+
+def _worker_id_str() -> str:
+    global _worker_id
+    if _worker_id is None:
+        _worker_id = f"{socket.gethostname()}:{os.getpid()}"
+    return _worker_id
 
 
 async def _process(job) -> None:
@@ -83,7 +94,7 @@ async def _run_loop() -> None:
     next_reclaim = 0.0
     next_queue_log = 0.0
     logger.info("indexing worker started: %s concurrency=%d",
-                _worker_id, settings.indexing_concurrency)
+                _worker_id_str(), settings.indexing_concurrency)
     while True:
         try:
             now = time.monotonic()
@@ -98,7 +109,7 @@ async def _run_loop() -> None:
             await slots.acquire()  # 先占空槽再领任务：槽满挂起，不预支任务
             try:
                 async with Session() as db:
-                    job = await scheduler.claim_next(db, _worker_id)
+                    job = await scheduler.claim_next(db, _worker_id_str())
             except Exception:
                 slots.release()  # 领取失败必还槽，否则槽位泄漏导致消费停摆
                 raise
