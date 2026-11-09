@@ -7,10 +7,15 @@
 领取走「条件 UPDATE 抢占」，多消费者安全（HTTP 池与任务池混跑亦然）；
 全局消费并发 = 消费进程数 × indexing_concurrency。
 
-每 30 秒顺带执行一次超时回收（消费者崩溃后的 running 行），
+每个任务由「执行 + 心跳」双协程护航：心跳周期续租 started_at，防长任务
+（合法运行超过超时阈值）被超时回收误判死亡而重投双跑；丢租约即取消执行
+止损（不再白白消耗 API）。心跳只证明进程活着，不感知任务进度。
+
+每 30 秒顺带执行一次超时回收（消费者崩溃后的 running 行）；
 单进程的回收在其他进程也照常生效（幂等 UPDATE）。
 """
 import asyncio
+import contextlib
 import logging
 import os
 import socket
@@ -25,6 +30,8 @@ logger = logging.getLogger("uvicorn.error")
 
 _RECLAIM_INTERVAL_SECONDS = 30
 _DRAIN_TIMEOUT_SECONDS = 5  # 停机等待在途协程的上限，等不完交给超时回收兜底
+# 心跳连续报到失败上限：偶发 DB 抖动容忍（不误杀），长时间失联止损（不白烧钱）
+_LEASE_MISS_TOLERANCE = 3
 
 _worker_task: asyncio.Task | None = None
 # 在途执行协程：持有引用防 GC 中途回收；stop_worker 据此优雅排空
@@ -42,12 +49,17 @@ async def _process(job) -> None:
         ok, error = False, f"{type(exc).__name__}: {exc}"
     try:
         async with Session() as db:
-            status = await scheduler.finish(db, job.id, ok, error)
+            # worker 参数取任务行自带的 job.worker（claim_next 抢占时已写好）；
+            # 丢租约时 finish 返回 None（行已被回收/接管，本进程不写终态）
+            status = await scheduler.finish(db, job.id, ok, job.worker, error)
         if status == "done":
             logger.info("indexing job done: md5=%s user=%s", job.md5, job.user)
         elif status == "pending":
             logger.warning("indexing job requeued (attempt %d): md5=%s err=%s",
                            job.attempts, job.md5, error)
+        elif status is None:
+            logger.warning("indexing job lease lost before finish: md5=%s（结果作废，"
+                           "由新持有者收敛）", job.md5)
         else:
             logger.error("indexing job failed permanently: md5=%s err=%s", job.md5, error)
     except Exception:
@@ -89,11 +101,72 @@ async def _run_loop() -> None:
             await asyncio.sleep(settings.indexing_poll_seconds)
 
 
+async def _heartbeat(job, lease_lost: asyncio.Event) -> None:
+    """
+    任务租约心跳：执行期间周期续租 started_at，与执行协程同生共死
+    （由 _run_job 的 finally 确定回收，不进 _inflight——那是执行协程的
+    防 GC 集合）。
+
+    先睡后跳：60s 间隔内完成的短任务一生零心跳（claim 抢占写入的
+    started_at 本身就是第 0 次报到）。数字账：心跳 60s / 超时 900s =
+    一个租约期 15 次续约机会；死亡检测延迟 = 最后心跳 + 900s（与无
+    心跳时一致，零退化）；满载 20 并发额外负载 ≈ 0.33 条 UPDATE/s。
+
+    三种退出：
+    - renewed：续约成功，连续失败清零，继续
+    - finished：行已收敛终态（自己的执行协程刚收尾）——安静退出，不打扰
+    - lost / 连续 _LEASE_MISS_TOLERANCE 次报到失败：置 lease_lost 交由
+      _run_job 取消执行止损
+    """
+    misses = 0
+    while True:
+        await asyncio.sleep(settings.indexing_lease_renew_seconds)
+        try:
+            async with Session() as db:
+                state = await scheduler.renew_lease(db, job.id, job.worker)
+        except Exception:
+            misses += 1
+            if misses >= _LEASE_MISS_TOLERANCE:
+                logger.warning("indexing lease renew failed %d times: md5=%s"
+                               "（按丢租约止损）", misses, job.md5)
+                lease_lost.set()
+                return
+            continue  # 偶发 DB 抖动容忍，不误杀
+        if state == scheduler.LEASE_RENEWED:
+            misses = 0
+            continue
+        if state == scheduler.LEASE_FINISHED:
+            return  # 自己刚收尾，安静退出
+        logger.warning("indexing lease lost: md5=%s worker=%s（行已被回收/接管）",
+                       job.md5, job.worker)
+        lease_lost.set()
+        return
+
+
 async def _run_job(job, slots: asyncio.Semaphore) -> None:
+    lease_lost = asyncio.Event()
+    heartbeat = asyncio.create_task(_heartbeat(job, lease_lost))
     try:
-        await _process(job)  # _process 已有异常围栏，正常不会抛出
+        execute = asyncio.create_task(_process(job))
+        watcher = asyncio.create_task(lease_lost.wait())
+        try:
+            await asyncio.wait({execute, watcher},
+                               return_when=asyncio.FIRST_COMPLETED)
+        finally:
+            watcher.cancel()
+            with contextlib.suppress(asyncio.CancelledError, Exception):
+                await watcher
+        if lease_lost.is_set() and not execute.done():
+            execute.cancel()  # 止损：行已被回收重投，继续跑只会重复消耗 API
+            logger.warning("indexing job cancelled on lease loss (已取消止损): "
+                           "md5=%s worker=%s", job.md5, job.worker)
+        with contextlib.suppress(asyncio.CancelledError, Exception):
+            await execute  # 回收执行协程（CancelledError 不被 _process 围栏吞掉）
     finally:
-        slots.release()  # 无论成败必还槽，槽位永不泄漏
+        heartbeat.cancel()  # 心跳与执行同生共死
+        with contextlib.suppress(asyncio.CancelledError, Exception):
+            await heartbeat
+        slots.release()  # 无论成败/丢租约必还槽，槽位永不泄漏
 
 
 def start_worker() -> None:

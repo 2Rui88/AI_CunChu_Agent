@@ -33,7 +33,8 @@ class IndexingJob(Base):
     attempts = Column(Integer, nullable=False, default=0, comment="已执行次数（含首次）")
     error = Column(String(512), default="", comment="最后一次失败的错误摘要")
     worker = Column(String(64), default="", comment="当前/最后领取者标识")
-    started_at = Column(TIMESTAMP, nullable=True, comment="最近一次领取时间（超时回收依据）")
+    started_at = Column(TIMESTAMP, nullable=True,
+                        comment="最近一次领取/心跳时间（超时回收依据）")
     finished_at = Column(TIMESTAMP, nullable=True, comment="终态时间")
     create_time = Column(TIMESTAMP, server_default=text("CURRENT_TIMESTAMP"))
     update_time = Column(TIMESTAMP, server_default=text("CURRENT_TIMESTAMP"),

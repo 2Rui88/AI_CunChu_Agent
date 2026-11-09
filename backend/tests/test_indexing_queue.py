@@ -1,5 +1,5 @@
 """
-向量化任务队列与限流层测试 —— 投递幂等 / 公平领取抢占 / 终态收敛 / 退避重试
+向量化任务队列与限流层测试 —— 投递幂等 / 公平领取抢占 / 租约续约 / 终态收敛 / 统计 / 退避重试
 
 覆盖场景：
 1.  enqueue：非 force 且已有用户索引 → 短路 done，不建任务
@@ -8,13 +8,17 @@
 4.  enqueue：failed 行再次投递 → 重置 pending 且 attempts 归零
 5.  claim_next：抢占 UPDATE 影响 0 行（被并发消费者抢走）→ 换下一候选
 6.  claim_next：候选全部被抢 → 返回 None
-7.  finish：成功 → done
+7.  finish：成功（持有者匹配）→ done
 8.  finish：失败且未超重试上限 → 回 pending（自动重试）
 9.  finish：失败且达到重试上限 → failed 终态
-10. call_with_backoff：前两次限流第三次成功 → 重试成功
-11. call_with_backoff：重试耗尽 → 抛最终错误
-12. call_with_backoff：非可重试异常 → 立即抛出不重试
-13. Gate：Redis 异常 → 闸门降级直通（不阻塞业务）
+10. finish：丢租约（行被回收/接管，UPDATE 0 行）→ 返回 None 不写终态
+11. renew_lease：本进程持有 running 行 → renewed（条件含 worker 与 status，显式提交）
+12. renew_lease：行已 done/failed → finished（安静退出信号）
+13. renew_lease：行已回 pending / 被他人接管 → lost（止损信号）
+14. call_with_backoff：前两次限流第三次成功 → 重试成功
+15. call_with_backoff：重试耗尽 → 抛最终错误
+16. call_with_backoff：非可重试异常 → 立即抛出不重试
+17. Gate：Redis 异常 → 闸门降级直通（不阻塞业务）
 """
 import asyncio
 import types
@@ -178,39 +182,79 @@ class TestClaimNext:
 class TestFinish:
 
     async def test_finish_ok(self):
-        """场景 7：成功 → done"""
-        db = _FakeDB()
-        status = await scheduler.finish(db, 1, True)
+        """场景 7：成功（持有者匹配）→ done；UPDATE 限定 worker 与 running"""
+        db = _FakeDB([_FakeResult(rowcount=1)])
+        status = await scheduler.finish(db, 1, True, "w1")
         assert status == "done"
         assert "status='done'" in db.calls[0][0]
+        assert "worker=:w" in db.calls[0][0]
+        assert "status='running'" in db.calls[0][0]
 
     async def test_finish_fail_retry(self):
         """场景 8：失败且 attempts<max → 回 pending"""
         db = _FakeDB([
-            _FakeResult(),                       # UPDATE
-            _select_result("pending"),           # 回读状态
+            _FakeResult(rowcount=1),            # UPDATE（自己持有）
+            _select_result("pending"),          # 回读状态
         ])
-        status = await scheduler.finish(db, 1, False, "embedding failed")
+        status = await scheduler.finish(db, 1, False, "w1", "embedding failed")
         assert status == "pending"
 
     async def test_finish_fail_permanent(self):
         """场景 9：失败且 attempts>=max → failed 终态"""
         db = _FakeDB([
-            _FakeResult(),
+            _FakeResult(rowcount=1),
             _select_result("failed"),
         ])
-        status = await scheduler.finish(db, 1, False, "embedding failed")
+        status = await scheduler.finish(db, 1, False, "w1", "embedding failed")
         assert status == "failed"
+
+    async def test_finish_lost_lease_returns_none(self):
+        """场景 10：丢租约（行被回收/接管，UPDATE 0 行）→ None，不写终态"""
+        db = _FakeDB([_FakeResult(rowcount=0)])
+        assert await scheduler.finish(db, 1, True, "w1") is None
+        assert db.committed == 1  # UPDATE 仍显式提交（红线）
 
 
 # ═══════════════════════════════════════════════════════════
-#  10-13. ratelimit 退避与闸门降级
+#  11-13. renew_lease 租约三态
+# ═══════════════════════════════════════════════════════════
+
+class TestRenewLease:
+
+    async def test_renewed_when_holder_matches(self):
+        """场景 11：本进程持有 running 行 → renewed；条件含 worker/status，显式提交"""
+        db = _FakeDB([_FakeResult(rowcount=1)])
+        assert await scheduler.renew_lease(db, 1, "w1") == scheduler.LEASE_RENEWED
+        sql = db.calls[0][0]
+        assert "started_at=NOW()" in sql
+        assert "status='running'" in sql and "worker=:w" in sql
+        assert db.committed == 1
+
+    async def test_finished_when_row_terminal(self):
+        """场景 12：行已 done/failed → finished（大概率自己刚收尾，安静退出）"""
+        db = _FakeDB([
+            _FakeResult(rowcount=0),        # 续约 UPDATE 未命中
+            _select_result("done"),         # 回读：已终态
+        ])
+        assert await scheduler.renew_lease(db, 1, "w1") == scheduler.LEASE_FINISHED
+
+    async def test_lost_when_requeued_or_taken_over(self):
+        """场景 13：行回 pending（被回收重投）或被他人接管 running → lost"""
+        db = _FakeDB([_FakeResult(rowcount=0), _select_result("pending")])
+        assert await scheduler.renew_lease(db, 1, "w1") == scheduler.LEASE_LOST
+
+        db2 = _FakeDB([_FakeResult(rowcount=0), _select_result("running")])
+        assert await scheduler.renew_lease(db2, 1, "w1") == scheduler.LEASE_LOST
+
+
+# ═══════════════════════════════════════════════════════════
+#  14-17. ratelimit 退避与闸门降级
 # ═══════════════════════════════════════════════════════════
 
 class TestBackoff:
 
     async def test_retry_then_success(self, monkeypatch):
-        """场景 10：前两次限流第三次成功 → 返回结果，共调用 3 次"""
+        """场景 14：前两次限流第三次成功 → 返回结果，共调用 3 次"""
         real_sleep = asyncio.sleep
         monkeypatch.setattr(asyncio, "sleep", lambda s: real_sleep(0))
         calls = {"n": 0}
@@ -225,7 +269,7 @@ class TestBackoff:
         assert calls["n"] == 3
 
     async def test_retry_exhausted(self, monkeypatch):
-        """场景 11：一直限流 → 重试耗尽后抛最终错误"""
+        """场景 15：一直限流 → 重试耗尽后抛最终错误"""
         real_sleep = asyncio.sleep
         monkeypatch.setattr(asyncio, "sleep", lambda s: real_sleep(0))
 
@@ -236,7 +280,7 @@ class TestBackoff:
             await ratelimit.call_with_backoff(fn)
 
     async def test_non_retryable_raises_immediately(self, monkeypatch):
-        """场景 12：业务异常不重试，立即抛出"""
+        """场景 16：业务异常不重试，立即抛出"""
         calls = {"n": 0}
 
         async def fn():
@@ -248,7 +292,7 @@ class TestBackoff:
         assert calls["n"] == 1
 
     async def test_gate_degrades_on_redis_failure(self, monkeypatch):
-        """场景 13：Redis 异常 → 闸门直通（业务不被阻塞）"""
+        """场景 17：Redis 异常 → 闸门直通（业务不被阻塞）"""
         async def broken_eval(*a, **kw):
             raise ConnectionError("redis down")
 

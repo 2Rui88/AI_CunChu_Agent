@@ -1,3 +1,4 @@
+from pydantic import model_validator
 from pydantic_settings import BaseSettings
 
 
@@ -88,6 +89,10 @@ class Settings(BaseSettings):
     indexing_concurrency: int = 4           # 单进程任务槽（先占槽再领任务）
     indexing_poll_seconds: float = 2.0      # 队列空时的轮询间隔（秒）
     indexing_job_timeout_seconds: int = 900 # running 超时视为消费者崩溃，回收重投
+    # 租约心跳间隔（秒）：执行期间周期续租 started_at，防长任务被超时回收
+    # 误判死亡而重投双跑。须 < 超时/3（一个租约期内至少 3 次续约机会兜住
+    # 偶发抖动），启动时校验器 fail-fast，配置错误不得静默上线成"无保护"
+    indexing_lease_renew_seconds: int = 60
     indexing_max_attempts: int = 3          # 失败自动重试上限（含首次执行）
 
     # ── DashScope 全局并发闸门（跨进程，Redis ZSET 计数）──
@@ -110,6 +115,17 @@ class Settings(BaseSettings):
     )
 
     model_config = {"env_file": ".env"}
+
+    @model_validator(mode="after")
+    def _lease_interval_must_allow_recovery(self):
+        # 心跳间隔 >= 超时/3 时，一个租约期内的续约机会不足以兜住偶发抖动，
+        # 心跳保护形同虚设——启动即抛错，不允许静默上线
+        if self.indexing_lease_renew_seconds >= self.indexing_job_timeout_seconds // 3:
+            raise ValueError(
+                f"indexing_lease_renew_seconds ({self.indexing_lease_renew_seconds}) "
+                f"must be < indexing_job_timeout_seconds/3 "
+                f"({self.indexing_job_timeout_seconds // 3})")
+        return self
 
 
 settings = Settings()

@@ -1,5 +1,5 @@
 """
-任务调度器 —— 投递 / 原子领取（公平） / 超时回收 / 终态收敛 / 状态查询
+任务调度器 —— 投递 / 原子领取（公平） / 超时回收 / 租约续约 / 终态收敛 / 状态与统计
 
 只操作 indexing_jobs 表本身，不执行任务（执行见 pipeline.run_indexing_job）。
 多消费者安全：领取是「公平选行 + 条件 UPDATE 抢占」，两个消费者同抢一行时
@@ -23,6 +23,11 @@ logger = logging.getLogger("uvicorn.error")
 QUEUED = "queued"          # 已投递（新任务或复用在途任务）
 ALREADY_DONE = "done"      # 非 force 且用户侧已有完成索引，无需任务
 REQUEUED = "requeued"      # failed/done 行被重置重新入队（手动重建）
+
+# 租约续约三态（worker 心跳据此分支）
+LEASE_RENEWED = "renewed"    # 续约成功，任务仍归本进程持有
+LEASE_FINISHED = "finished"  # 行已收敛终态（大概率是自己刚收尾）——安静退出
+LEASE_LOST = "lost"          # 行已被回收重投/被他人接管——调用方应止损
 
 # 公平选行：该用户 running 数最少的 pending 优先，同优先级按 id FIFO
 _PICK_SQL = text(
@@ -112,6 +117,33 @@ async def claim_next(db, worker_id: str) -> IndexingJob | None:
     return None
 
 
+async def renew_lease(db, job_id: int, worker: str) -> str:
+    """
+    任务租约续期（消费者心跳调用）：把 started_at 推到当前时刻。
+
+    心跳证明的是「本进程（事件循环）仍活着」，不感知任务进度；执行/心跳
+    共享事件循环、同生共死。条件限定 status='running' 且 worker 匹配：
+    只有当前持有者的续约才生效。返回三态——
+    - renewed：续约成功；
+    - finished：行已 done/failed（大概率是自己的执行协程刚收尾），
+      调用方应安静退出，不得触发取消；
+    - lost：行已回 pending（被超时回收重投）或被其他 worker 接管，
+      调用方应取消执行止损（旧执行者继续跑只会重复消耗 API）。
+    """
+    result = await db.execute(
+        text("UPDATE indexing_jobs SET started_at=NOW() "
+             "WHERE id=:id AND status='running' AND worker=:w"),
+        {"id": job_id, "w": worker},
+    )
+    await db.commit()  # 抢占/续约/终态类 UPDATE 后必须显式提交
+    if result.rowcount == 1:
+        return LEASE_RENEWED
+    status = (await db.execute(
+        select(IndexingJob.status).where(IndexingJob.id == job_id)
+    )).scalar()
+    return LEASE_FINISHED if status in ("done", "failed") else LEASE_LOST
+
+
 async def reclaim_stale(db) -> int:
     """
     回收超时 running（消费者崩溃/被杀）：attempts 未超上限 → 回 pending 重投；
@@ -137,28 +169,37 @@ async def reclaim_stale(db) -> int:
     return result.rowcount
 
 
-async def finish(db, job_id: int, ok: bool, error: str = "") -> str:
+async def finish(db, job_id: int, ok: bool, worker: str, error: str = "") -> str | None:
     """
-    收敛终态：成功 → done；失败且 attempts < max → 回 pending（自动重试）；
-    失败且 attempts >= max → failed。返回最终状态。
+    收敛终态（仅持有者可写）：成功 → done；失败且 attempts < max → 回 pending
+    （自动重试）；失败且 attempts >= max → failed。返回最终状态。
+
+    WHERE 限定 status='running' 且 worker 匹配：丢租约的旧执行者（行已被
+    超时回收重投或被他人接管）影响 0 行，返回 None——旧执行者既不踩踏
+    新持有者的行、也不写终态（该次执行作废，由新持有者/重试收敛）。
     """
     err = (error or "")[:500]
     if ok:
-        await db.execute(
+        result = await db.execute(
             text("UPDATE indexing_jobs SET status='done', error='', worker='', "
-                 "finished_at=NOW() WHERE id=:id"),
-            {"id": job_id},
+                 "finished_at=NOW() "
+                 "WHERE id=:id AND status='running' AND worker=:w"),
+            {"id": job_id, "w": worker},
         )
-        await db.commit()
-        return "done"
-    result = await db.execute(
-        text("UPDATE indexing_jobs SET status=IF(attempts < :maxa, 'pending', 'failed'), "
-             "error=:err, worker='', "
-             "finished_at=IF(attempts >= :maxa, NOW(), finished_at) "
-             "WHERE id=:id"),
-        {"maxa": settings.indexing_max_attempts, "err": err, "id": job_id},
-    )
+    else:
+        result = await db.execute(
+            text("UPDATE indexing_jobs SET status=IF(attempts < :maxa, 'pending', 'failed'), "
+                 "error=:err, worker='', "
+                 "finished_at=IF(attempts >= :maxa, NOW(), finished_at) "
+                 "WHERE id=:id AND status='running' AND worker=:w"),
+            {"maxa": settings.indexing_max_attempts, "err": err,
+             "id": job_id, "w": worker},
+        )
     await db.commit()
+    if result.rowcount == 0:
+        return None  # 丢租约：行不归自己，不写终态
+    if ok:
+        return "done"
     # 回读最终状态（pending=会重试 / failed=终态）
     job = (await db.execute(
         select(IndexingJob.status).where(IndexingJob.id == job_id)

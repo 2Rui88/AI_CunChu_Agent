@@ -1,5 +1,5 @@
 """
-消费循环并发模型测试 —— 领单/执行分离 + 信号量任务槽
+消费循环并发模型测试 —— 领单/执行分离 + 信号量任务槽 + 租约心跳
 
 覆盖场景：
 1.  槽满时不领取（按需领取：先占槽再 claim，DB 中 running 数 ≤ 槽数）
@@ -9,13 +9,19 @@
 5.  _run_job 异常路径必还槽（_process 围栏失效时 finally 兜底）
 6.  stop_worker：在途协程已结束 → 干净返回，无残留
 7.  stop_worker：在途协程卡死 → 排空超时后放弃（交给超时回收兜底）
+8.  心跳按间隔周期续约；执行结束后心跳同死（不再续约）
+9.  renew 返回 finished → 心跳安静退出，不取消执行
+10. 偶发 DB 异常单次容忍（不触发止损）
+11. 连续 3 次报到失败 → 取消执行止损且槽位仍归还
+12. renew 返回 lost → 取消执行止损且槽位仍归还
+13. 短任务（< 心跳间隔）一生零续约调用
 """
 import asyncio
 import contextlib
 
 import pytest
 
-from app.indexing import worker
+from app.indexing import scheduler, worker
 from app.indexing.models import IndexingJob
 
 
@@ -61,6 +67,32 @@ def _gated_process(started: asyncio.Event, release: asyncio.Event, sink: list):
         started.set()
         await release.wait()
     return _process
+
+
+def _traced_process(release: asyncio.Event):
+    """可追踪三态的 _process 桩：记录 started/cancelled/done（供心跳测试断言）"""
+    state = {"started": False, "cancelled": False, "done": False}
+
+    async def _process(job):
+        state["started"] = True
+        try:
+            await release.wait()
+            state["done"] = True
+        except asyncio.CancelledError:
+            state["cancelled"] = True
+            raise
+    return _process, state
+
+
+def _renew_stub(script: list, calls: list):
+    """按脚本回放的 renew_lease 桩：记录调用，脚本耗尽后回 renewed"""
+    async def _renew(db, job_id, worker_id):
+        calls.append(worker_id)
+        item = script.pop(0) if script else scheduler.LEASE_RENEWED
+        if isinstance(item, Exception):
+            raise item
+        return item
+    return _renew
 
 
 async def _wait_until(predicate, timeout=2.0, what="condition"):
@@ -202,16 +234,17 @@ class TestSlotReleaseOnError:
             release.set()
 
     async def test_run_job_releases_slot_on_error(self, monkeypatch):
-        """场景 5：_process 异常逃逸围栏 → _run_job 的 finally 仍还槽"""
+        """场景 5：_process 异常逃逸围栏 → _run_job 吞掉异常返回（派发任务不得
+        逃逸异常），finally 仍还槽"""
         async def boom(job):
             raise RuntimeError("fence broken")
 
         monkeypatch.setattr(worker, "_process", boom)
+        monkeypatch.setattr(worker, "Session", lambda: _FakeSessionCtx())
         slots = asyncio.Semaphore(1)
         await slots.acquire()  # 占满唯一槽位
 
-        with pytest.raises(RuntimeError):
-            await worker._run_job(_job(), slots)
+        await asyncio.wait_for(worker._run_job(_job(), slots), timeout=2)  # 不抛出
 
         assert not slots.locked()  # 槽已归还
         await asyncio.wait_for(slots.acquire(), timeout=0.1)  # 可立即再次获取
@@ -260,3 +293,127 @@ class TestStopWorker:
         release.set()  # 测试收尾：放行并回收协程
         with contextlib.suppress(Exception):
             await asyncio.wait_for(stuck, timeout=1)
+
+
+# ═══════════════════════════════════════════════════════════
+#  8-13. 任务租约心跳（执行/心跳双协程护航）
+# ═══════════════════════════════════════════════════════════
+
+class TestLeaseHeartbeat:
+
+    async def test_heartbeat_renews_periodically_then_dies_with_job(
+            self, monkeypatch):
+        """场景 8：执行期间按间隔续约；执行结束后心跳同死，不再续约"""
+        monkeypatch.setattr(worker.settings, "indexing_lease_renew_seconds", 0.02)
+        release = asyncio.Event()
+        process, state = _traced_process(release)
+        calls: list = []
+        monkeypatch.setattr(worker, "Session", lambda: _FakeSessionCtx())
+        monkeypatch.setattr(worker, "_process", process)
+        monkeypatch.setattr(worker.scheduler, "renew_lease", _renew_stub([], calls))
+
+        slots = asyncio.Semaphore(1)
+        runner = asyncio.create_task(worker._run_job(_job(), slots))
+        await _wait_until(lambda: len(calls) >= 2, what="周期续约至少两次")
+        assert not state["cancelled"]
+
+        release.set()  # 任务正常完成 → 心跳应在 finally 被回收
+        await asyncio.wait_for(runner, timeout=2)
+        snapshot = len(calls)
+        await asyncio.sleep(0.08)  # 留出 4 个心跳周期，确认不再续约
+        assert len(calls) == snapshot
+        assert state["done"] and not slots.locked()
+
+    async def test_finished_state_is_quiet(self, monkeypatch):
+        """场景 9：renew 返回 finished（自己刚收尾）→ 心跳安静退出，不取消执行"""
+        monkeypatch.setattr(worker.settings, "indexing_lease_renew_seconds", 0.02)
+        release = asyncio.Event()
+        process, state = _traced_process(release)
+        calls: list = []
+        monkeypatch.setattr(worker, "Session", lambda: _FakeSessionCtx())
+        monkeypatch.setattr(worker, "_process", process)
+        monkeypatch.setattr(worker.scheduler, "renew_lease",
+                            _renew_stub([scheduler.LEASE_FINISHED], calls))
+
+        slots = asyncio.Semaphore(1)
+        runner = asyncio.create_task(worker._run_job(_job(), slots))
+        await _wait_until(lambda: len(calls) == 1, what="首次心跳返回 finished")
+        await asyncio.sleep(0.08)  # 若误判取消，state["cancelled"] 会在此内置位
+        assert not state["cancelled"] and not state["done"]
+
+        release.set()  # 仍应正常跑完
+        await asyncio.wait_for(runner, timeout=2)
+        assert state["done"] and not slots.locked()
+
+    async def test_single_db_glitch_tolerated(self, monkeypatch):
+        """场景 10：偶发 DB 异常 1 次不触发止损，续约恢复后任务照常完成"""
+        monkeypatch.setattr(worker.settings, "indexing_lease_renew_seconds", 0.02)
+        release = asyncio.Event()
+        process, state = _traced_process(release)
+        calls: list = []
+        monkeypatch.setattr(worker, "Session", lambda: _FakeSessionCtx())
+        monkeypatch.setattr(worker, "_process", process)
+        monkeypatch.setattr(worker.scheduler, "renew_lease",
+                            _renew_stub([ConnectionError("db jitter")], calls))
+
+        slots = asyncio.Semaphore(1)
+        runner = asyncio.create_task(worker._run_job(_job(), slots))
+        await _wait_until(lambda: len(calls) >= 3, what="抖动后恢复续约")
+        assert not state["cancelled"]
+
+        release.set()
+        await asyncio.wait_for(runner, timeout=2)
+        assert state["done"] and not slots.locked()
+
+    async def test_three_consecutive_misses_cancel_and_release(self, monkeypatch):
+        """场景 11：连续 3 次报到失败 → 按丢租约取消执行止损，槽位仍归还"""
+        monkeypatch.setattr(worker.settings, "indexing_lease_renew_seconds", 0.02)
+        release = asyncio.Event()  # 永不置位：模拟长任务在途
+        process, state = _traced_process(release)
+        calls: list = []
+        monkeypatch.setattr(worker, "Session", lambda: _FakeSessionCtx())
+        monkeypatch.setattr(worker, "_process", process)
+        monkeypatch.setattr(worker.scheduler, "renew_lease",
+                            _renew_stub([ConnectionError("db down")] * 3, calls))
+
+        slots = asyncio.Semaphore(1)
+        runner = asyncio.create_task(worker._run_job(_job(), slots))
+        await asyncio.wait_for(runner, timeout=2)  # 止损后 _run_job 自行返回
+        assert len(calls) == worker._LEASE_MISS_TOLERANCE
+        assert state["cancelled"] and not state["done"]
+        assert not slots.locked()  # 丢租约取消路径同样必还槽
+
+    async def test_lost_state_cancels_and_releases(self, monkeypatch):
+        """场景 12：renew 返回 lost（行被回收/接管）→ 取消执行止损，槽位仍归还"""
+        monkeypatch.setattr(worker.settings, "indexing_lease_renew_seconds", 0.02)
+        release = asyncio.Event()
+        process, state = _traced_process(release)
+        calls: list = []
+        monkeypatch.setattr(worker, "Session", lambda: _FakeSessionCtx())
+        monkeypatch.setattr(worker, "_process", process)
+        monkeypatch.setattr(worker.scheduler, "renew_lease",
+                            _renew_stub([scheduler.LEASE_LOST], calls))
+
+        slots = asyncio.Semaphore(1)
+        runner = asyncio.create_task(worker._run_job(_job(), slots))
+        await asyncio.wait_for(runner, timeout=2)
+        assert len(calls) == 1
+        assert state["cancelled"] and not state["done"]
+        assert not slots.locked()
+
+    async def test_short_job_never_renews(self, monkeypatch):
+        """场景 13：先睡后跳——心跳间隔内完成的短任务一生零续约调用"""
+        monkeypatch.setattr(worker.settings, "indexing_lease_renew_seconds", 0.05)
+        release = asyncio.Event()
+        release.set()  # 任务立即完成
+        process, state = _traced_process(release)
+        calls: list = []
+        monkeypatch.setattr(worker, "Session", lambda: _FakeSessionCtx())
+        monkeypatch.setattr(worker, "_process", process)
+        monkeypatch.setattr(worker.scheduler, "renew_lease", _renew_stub([], calls))
+
+        slots = asyncio.Semaphore(1)
+        await asyncio.wait_for(worker._run_job(_job(), slots), timeout=2)
+        await asyncio.sleep(0.2)  # 留出 4 个心跳周期，确认没有事后续约
+        assert calls == []
+        assert state["done"] and not slots.locked()
