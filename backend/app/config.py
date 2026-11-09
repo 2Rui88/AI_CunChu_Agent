@@ -8,6 +8,10 @@ class Settings(BaseSettings):
     mysql_user: str = "root"
     mysql_password: str = ""
     mysql_db: str = "yuncunchu"
+    # 连接池（角色分池：HTTP 池默认 10+20；任务池由 compose 收紧为 8+12，
+    # 两池合计不超过 MySQL max_connections 的安全水位）
+    mysql_pool_size: int = 10
+    mysql_max_overflow: int = 20
 
     # ── Redis ──
     redis_host: str = "localhost"
@@ -78,11 +82,13 @@ class Settings(BaseSettings):
 
     # ── 向量化任务队列（indexing_jobs）──
     # 上传只投递任务立即返回；重活（下载/提取/描述/向量化）由后台消费者执行。
-    # 全局消费并发 = 后端进程数 × indexing_concurrency（原子领取保证多消费者安全）
-    indexing_concurrency: int = 1            # 单进程同时处理的任务数
-    indexing_poll_seconds: float = 2.0       # 队列空时的轮询间隔（秒）
-    indexing_job_timeout_seconds: int = 900  # running 超时视为消费者崩溃，回收重投
-    indexing_max_attempts: int = 3           # 失败自动重试上限（含首次执行）
+    # 角色分化：INDEXING_WORKER_ENABLED=0 的进程（HTTP 池）不跑消费循环，
+    # 任务池专职消费；全局消费并发 = 消费进程数 × indexing_concurrency
+    indexing_worker_enabled: bool = True    # 本进程是否运行消费循环（灰度期默认开）
+    indexing_concurrency: int = 4           # 单进程任务槽（先占槽再领任务）
+    indexing_poll_seconds: float = 2.0      # 队列空时的轮询间隔（秒）
+    indexing_job_timeout_seconds: int = 900 # running 超时视为消费者崩溃，回收重投
+    indexing_max_attempts: int = 3          # 失败自动重试上限（含首次执行）
 
     # ── DashScope 全局并发闸门（跨进程，Redis ZSET 计数）──
     # 共享 API Key 的保护层：embedding/chat/vl 各自限并行，超出排队；

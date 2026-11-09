@@ -20,8 +20,8 @@ engine = create_async_engine(
         database=settings.mysql_db,
         query={"charset": "utf8mb4"},
     ),
-    pool_size=10,
-    max_overflow=20,
+    pool_size=settings.mysql_pool_size,
+    max_overflow=settings.mysql_max_overflow,
     pool_pre_ping=True,  # 取连接前探活，MySQL 重启后自动丢弃失效连接
 )
 

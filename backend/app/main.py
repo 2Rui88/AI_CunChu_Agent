@@ -20,10 +20,13 @@ async def lifespan(app: FastAPI):
     except Exception as exc:
         logger.error("startup init failed: %s", exc)
         raise
-    # 向量化任务消费循环：每进程一份，多 worker 部署时原子领取保证安全
-    start_worker()
+    # 向量化任务消费循环：仅任务角色进程运行（HTTP 池置 INDEXING_WORKER_ENABLED=0
+    # 时不消费，网页请求不与后台任务抢资源；启停必须同条件，防只停不启残留）
+    if settings.indexing_worker_enabled:
+        start_worker()
     yield
-    await stop_worker()
+    if settings.indexing_worker_enabled:
+        await stop_worker()
 
 
 app = FastAPI(title="AI-YunCunChu", lifespan=lifespan)
