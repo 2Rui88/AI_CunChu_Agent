@@ -63,7 +63,7 @@
 
 ### AI 文件理解
 
-- **异步向量化任务队列**：上传只向 `indexing_jobs` 表投递任务并立即返回，下载/提取/描述/向量化由后台消费者异步执行（`app/indexing` 包）；多用户上传高峰不再占用 HTTP 请求，任务失败自动重试（默认 3 次），消费者崩溃由超时回收兜底
+- **异步向量化任务队列**：上传只向 `indexing_jobs` 表投递任务并立即返回，下载/提取/描述/向量化由后台消费者异步执行（`app/indexing` 包）；多用户上传高峰不再占用 HTTP 请求，任务失败自动重试（默认 3 次），消费者崩溃由超时回收兜底；执行期间按分钟级心跳续租 started_at——长任务不再被超时回收误杀双跑，丢租约即取消执行止损
 - **公平调度**：多消费者原子领取（条件 UPDATE 抢占，多进程安全），优先服务"当前在跑任务最少"的用户，防单个大文件队列饿死其他用户
 - **多模态描述**：图片上传后调用 Qwen-VL 生成中文描述，文本文件直接提取内容
 - **多格式解析**：PDF（逐页提取+字号检测）、Excel（按工作表+行解析）、Word（解压 XML 提取）、Markdown（标题识别）、代码（函数/类声明识别）
@@ -250,6 +250,8 @@ tc_nginx         :443/80 Nginx 反向代理（只指向 tc_backend）
 | `/api/agent/conversations` | POST | 历史会话列表（分页） |
 | `/api/agent/conversations/messages` | POST | 读取会话消息（支持 before_seq 向上翻页） |
 | `/api/agent/conversations/delete` | POST | 软删除会话 |
+| `/api/indexing/status` | POST | 向量化任务状态查询（前端轮询进度） |
+| `/api/indexing/stats` | POST | 队列全局聚合统计（pending/running/failed、最老 pending 年龄、活跃消费者数；监控用） |
 
 ## 配置说明
 

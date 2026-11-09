@@ -15,10 +15,12 @@
 11. renew_lease：本进程持有 running 行 → renewed（条件含 worker 与 status，显式提交）
 12. renew_lease：行已 done/failed → finished（安静退出信号）
 13. renew_lease：行已回 pending / 被他人接管 → lost（止损信号）
-14. call_with_backoff：前两次限流第三次成功 → 重试成功
-15. call_with_backoff：重试耗尽 → 抛最终错误
-16. call_with_backoff：非可重试异常 → 立即抛出不重试
-17. Gate：Redis 异常 → 闸门降级直通（不阻塞业务）
+14. queue_stats：全局聚合（各状态计数/最老 pending/去重 worker 数）
+15. /api/indexing/stats：鉴权失败 code=4；通过后透传聚合
+16. call_with_backoff：前两次限流第三次成功 → 重试成功
+17. call_with_backoff：重试耗尽 → 抛最终错误
+18. call_with_backoff：非可重试异常 → 立即抛出不重试
+19. Gate：Redis 异常 → 闸门降级直通（不阻塞业务）
 """
 import asyncio
 import types
@@ -248,13 +250,87 @@ class TestRenewLease:
 
 
 # ═══════════════════════════════════════════════════════════
-#  14-17. ratelimit 退避与闸门降级
+#  14-15. 队列统计与监控端点
+# ═══════════════════════════════════════════════════════════
+
+class TestQueueStats:
+
+    async def test_aggregates_counts_and_age(self):
+        """场景 14：各状态计数 + 最老 pending 年龄（DB 侧 TIMESTAMPDIFF）+ 去重 worker"""
+        db = _FakeDB([
+            _FakeResult(scalars_all=[("pending", 3), ("running", 2), ("done", 10)]),
+            _select_result(120),
+            _select_result(2),
+        ])
+        stats = await scheduler.queue_stats(db)
+        assert stats == {
+            "pending": 3, "running": 2, "done": 10, "failed": 0,
+            "oldest_pending_seconds": 120, "active_workers": 2,
+        }
+        assert "TIMESTAMPDIFF" in db.calls[1][0]  # 红线：时间判定在数据库侧
+
+
+class TestStatsEndpoint:
+
+    def _client(self):
+        from fastapi import FastAPI
+        from fastapi.testclient import TestClient
+        from app.routers import indexing as indexing_router
+
+        app = FastAPI()
+        app.include_router(indexing_router.router)
+        return TestClient(app)
+
+    def test_rejects_bad_token(self, monkeypatch):
+        """场景 15a：鉴权失败 → code=4，不触发统计查询"""
+        async def bad_token(user, token):
+            return False
+
+        from app.routers import indexing as indexing_router
+        monkeypatch.setattr(indexing_router, "check_token", bad_token)
+        resp = self._client().post("/api/indexing/stats",
+                                   json={"user": "u1", "token": "bad"})
+        assert resp.status_code == 200
+        assert resp.json()["code"] == 4
+
+    def test_returns_aggregates(self, monkeypatch):
+        """场景 15b：鉴权通过 → 透传 scheduler.queue_stats 聚合结果"""
+        from app.routers import indexing as indexing_router
+
+        async def good_token(user, token):
+            return True
+
+        stats = {"pending": 3, "running": 1, "done": 5, "failed": 0,
+                 "oldest_pending_seconds": 42, "active_workers": 1}
+
+        async def fake_stats(db):
+            return stats
+
+        class _FakeSessionCtx:
+            async def __aenter__(self):
+                return object()
+
+            async def __aexit__(self, *exc):
+                return False
+
+        monkeypatch.setattr(indexing_router, "check_token", good_token)
+        monkeypatch.setattr(indexing_router.scheduler, "queue_stats", fake_stats)
+        monkeypatch.setattr(indexing_router, "Session", lambda: _FakeSessionCtx())
+        resp = self._client().post("/api/indexing/stats",
+                                   json={"user": "u1", "token": "ok"})
+        body = resp.json()
+        assert body["code"] == 0
+        assert body["queue"] == stats
+
+
+# ═══════════════════════════════════════════════════════════
+#  16-19. ratelimit 退避与闸门降级
 # ═══════════════════════════════════════════════════════════
 
 class TestBackoff:
 
     async def test_retry_then_success(self, monkeypatch):
-        """场景 14：前两次限流第三次成功 → 返回结果，共调用 3 次"""
+        """场景 16：前两次限流第三次成功 → 返回结果，共调用 3 次"""
         real_sleep = asyncio.sleep
         monkeypatch.setattr(asyncio, "sleep", lambda s: real_sleep(0))
         calls = {"n": 0}
@@ -269,7 +345,7 @@ class TestBackoff:
         assert calls["n"] == 3
 
     async def test_retry_exhausted(self, monkeypatch):
-        """场景 15：一直限流 → 重试耗尽后抛最终错误"""
+        """场景 17：一直限流 → 重试耗尽后抛最终错误"""
         real_sleep = asyncio.sleep
         monkeypatch.setattr(asyncio, "sleep", lambda s: real_sleep(0))
 
@@ -280,7 +356,7 @@ class TestBackoff:
             await ratelimit.call_with_backoff(fn)
 
     async def test_non_retryable_raises_immediately(self, monkeypatch):
-        """场景 16：业务异常不重试，立即抛出"""
+        """场景 18：业务异常不重试，立即抛出"""
         calls = {"n": 0}
 
         async def fn():
@@ -292,7 +368,7 @@ class TestBackoff:
         assert calls["n"] == 1
 
     async def test_gate_degrades_on_redis_failure(self, monkeypatch):
-        """场景 17：Redis 异常 → 闸门直通（业务不被阻塞）"""
+        """场景 19：Redis 异常 → 闸门直通（业务不被阻塞）"""
         async def broken_eval(*a, **kw):
             raise ConnectionError("redis down")
 

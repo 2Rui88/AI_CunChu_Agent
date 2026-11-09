@@ -131,6 +131,11 @@ def _wire(monkeypatch, sched, process=None):
     monkeypatch.setattr(worker, "Session", lambda: _FakeSessionCtx())
     monkeypatch.setattr(worker.scheduler, "reclaim_stale", sched.reclaim_stale)
     monkeypatch.setattr(worker.scheduler, "claim_next", sched.claim_next)
+
+    async def _no_stats():  # 领单循环首迭代即打水位日志，桩掉避免触真实 DB
+        pass
+
+    monkeypatch.setattr(worker, "_log_queue_stats", _no_stats)
     if process is not None:
         monkeypatch.setattr(worker, "_process", process)
 

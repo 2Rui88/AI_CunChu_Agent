@@ -215,3 +215,34 @@ async def get_status(db, *, user: str, md5: str) -> dict | None:
     if job is None or job.user != user:
         return None
     return job.public_dict()
+
+
+async def queue_stats(db) -> dict:
+    """
+    队列全局聚合统计（监控用，不含任何用户名）：
+    各 status 计数 / 最老 pending 等待秒数 / running 行的去重 worker 数。
+
+    时间一律用数据库侧 NOW()/TIMESTAMPDIFF 计算（MySQL 会话时区 +08:00，
+    Python 侧时间与之比较会把刚入队的任务算成超时）。
+    判定口径：最老 pending 年龄持续增长 && running==0 ⇒ 没有活着的消费者
+    （容器 up 但没人消费：开关配错/循环卡死，Docker 健康检查看不见）。
+    """
+    counts = dict((await db.execute(
+        text("SELECT status, COUNT(*) FROM indexing_jobs GROUP BY status")
+    )).all())
+    oldest = (await db.execute(
+        text("SELECT TIMESTAMPDIFF(SECOND, MIN(create_time), NOW()) "
+             "FROM indexing_jobs WHERE status='pending'")
+    )).scalar()
+    workers = (await db.execute(
+        text("SELECT COUNT(DISTINCT worker) FROM indexing_jobs "
+             "WHERE status='running' AND worker <> ''")
+    )).scalar()
+    return {
+        "pending": counts.get("pending", 0),
+        "running": counts.get("running", 0),
+        "done": counts.get("done", 0),
+        "failed": counts.get("failed", 0),
+        "oldest_pending_seconds": int(oldest or 0),
+        "active_workers": int(workers or 0),
+    }

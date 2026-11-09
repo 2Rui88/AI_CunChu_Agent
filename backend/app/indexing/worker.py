@@ -11,8 +11,8 @@
 （合法运行超过超时阈值）被超时回收误判死亡而重投双跑；丢租约即取消执行
 止损（不再白白消耗 API）。心跳只证明进程活着，不感知任务进度。
 
-每 30 秒顺带执行一次超时回收（消费者崩溃后的 running 行）；
-单进程的回收在其他进程也照常生效（幂等 UPDATE）。
+每 30 秒顺带执行一次超时回收（消费者崩溃后的 running 行），每 300 秒
+输出一行队列水位日志；单进程的回收在其他进程也照常生效（幂等 UPDATE）。
 """
 import asyncio
 import contextlib
@@ -29,6 +29,7 @@ from app.indexing.pipeline import run_indexing_job
 logger = logging.getLogger("uvicorn.error")
 
 _RECLAIM_INTERVAL_SECONDS = 30
+_QUEUE_LOG_INTERVAL_SECONDS = 300  # 队列水位日志节奏（灰度期直接看 docker logs）
 _DRAIN_TIMEOUT_SECONDS = 5  # 停机等待在途协程的上限，等不完交给超时回收兜底
 # 心跳连续报到失败上限：偶发 DB 抖动容忍（不误杀），长时间失联止损（不白烧钱）
 _LEASE_MISS_TOLERANCE = 3
@@ -66,9 +67,21 @@ async def _process(job) -> None:
         logger.exception("indexing job finish failed: md5=%s（将依赖超时回收）", job.md5)
 
 
+async def _log_queue_stats() -> None:
+    """输出一行队列水位（一条聚合 SQL 的代价；堵"容器 up 但没人消费"盲区）"""
+    try:
+        async with Session() as db:
+            q = await scheduler.queue_stats(db)
+        logger.info("indexing queue: pending=%d running=%d failed=%d oldest_pending=%ds",
+                    q["pending"], q["running"], q["failed"], q["oldest_pending_seconds"])
+    except Exception as exc:
+        logger.warning("indexing queue stats failed: %s", exc)
+
+
 async def _run_loop() -> None:
     slots = asyncio.Semaphore(max(1, settings.indexing_concurrency))
     next_reclaim = 0.0
+    next_queue_log = 0.0
     logger.info("indexing worker started: %s concurrency=%d",
                 _worker_id, settings.indexing_concurrency)
     while True:
@@ -78,6 +91,9 @@ async def _run_loop() -> None:
                 async with Session() as db:
                     await scheduler.reclaim_stale(db)
                 next_reclaim = now + _RECLAIM_INTERVAL_SECONDS
+            if now >= next_queue_log:
+                await _log_queue_stats()
+                next_queue_log = now + _QUEUE_LOG_INTERVAL_SECONDS
 
             await slots.acquire()  # 先占空槽再领任务：槽满挂起，不预支任务
             try:
