@@ -218,11 +218,12 @@ AI_CunChu_Agent/
                   ├── /api/agent/   → Agent SSE (8000，关闭缓冲 + 600s 读超时)
                   └── /dl/          → MinIO (9000，预签名下载代理)
 
-tc_mysql   :3306     MySQL 8.0（时区固定 +08:00）
-tc_redis   :6379     Redis 7
-tc_minio   :9000     MinIO 对象存储
-tc_backend :8000     Gunicorn (8 workers) + FastAPI
-tc_nginx   :443/80   Nginx 反向代理
+tc_mysql         :3306   MySQL 8.0（时区固定 +08:00）
+tc_redis         :6379   Redis 7
+tc_minio         :9000   MinIO 对象存储
+tc_backend       :8000   HTTP 池：Gunicorn (3 workers) + FastAPI（不消费任务，周期回收）
+tc_backend_worker        任务池：Gunicorn (5 workers，仅跑消费循环，并发 5×4=20，永不回收）
+tc_nginx         :443/80 Nginx 反向代理（只指向 tc_backend）
 ```
 
 ## API 概览
