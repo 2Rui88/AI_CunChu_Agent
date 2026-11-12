@@ -2,6 +2,13 @@
 -- 与 backend/app/models.py 中的 ORM 定义保持一致（create_all 亦为幂等兜底）
 -- 由 docker-entrypoint-initdb.d 在 MySQL 数据卷首次初始化时自动执行
 
+-- 部门（多部门数据隔离：文件/共享只在部门内可见）
+CREATE TABLE IF NOT EXISTS departments (
+    id INT AUTO_INCREMENT PRIMARY KEY,
+    name VARCHAR(64) NOT NULL UNIQUE,
+    create_time TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+
 CREATE TABLE IF NOT EXISTS user_info (
     id BIGINT AUTO_INCREMENT PRIMARY KEY,
     user_name VARCHAR(32) NOT NULL UNIQUE,
@@ -11,7 +18,10 @@ CREATE TABLE IF NOT EXISTS user_info (
     algo VARCHAR(16) NOT NULL DEFAULT 'md5',     -- 密码算法: md5(旧)/bcrypt
     phone VARCHAR(16) DEFAULT '',
     email VARCHAR(64) DEFAULT '',
-    create_time TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    department_id INT NOT NULL DEFAULT 1,        -- 所属部门（新注册用户进默认部门，由 SQL/管理员调配）
+    role VARCHAR(16) NOT NULL DEFAULT 'member',  -- member 普通成员 / supervisor 主管
+    create_time TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    KEY idx_user_dept (department_id)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
 
 CREATE TABLE IF NOT EXISTS file_info (
@@ -31,21 +41,26 @@ CREATE TABLE IF NOT EXISTS user_file_list (
     file_name VARCHAR(128),
     shared_status INT DEFAULT 0,
     pv INT DEFAULT 0,
+    department_id INT NOT NULL DEFAULT 1,        -- 文件所属部门（=上传者部门）
     create_time TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
     KEY idx_ufl_user (user),
-    KEY idx_ufl_user_md5 (user, md5(191))
+    KEY idx_ufl_user_md5 (user, md5(191)),
+    KEY idx_ufl_dept (department_id)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
 
+-- 共享语义按部门隔离：唯一性为部门内 (department_id, md5, file_name)
 CREATE TABLE IF NOT EXISTS share_file_list (
     id INT AUTO_INCREMENT PRIMARY KEY,
     user VARCHAR(32) NOT NULL,
     md5 VARCHAR(256) NOT NULL,
     file_name VARCHAR(128),
     pv INT DEFAULT 0,
+    department_id INT NOT NULL DEFAULT 1,        -- 共享所在部门
     create_time TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-    UNIQUE KEY uq_share_md5_filename (md5, file_name),
+    UNIQUE KEY uq_share_dept_md5_filename (department_id, md5(191), file_name),
     KEY idx_sfl_user (user),
-    KEY idx_sfl_md5 (md5(191))
+    KEY idx_sfl_md5 (md5(191)),
+    KEY idx_sfl_dept (department_id)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
 
 CREATE TABLE IF NOT EXISTS user_file_count (

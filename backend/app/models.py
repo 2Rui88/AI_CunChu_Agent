@@ -6,6 +6,15 @@ from sqlalchemy.dialects.mysql import MEDIUMBLOB, MEDIUMTEXT
 from app.database import Base
 
 
+class Department(Base):
+    """部门（多部门数据隔离：文件/共享只在部门内可见；本期部门与角色由 SQL 维护）"""
+    __tablename__ = "departments"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    name = Column(String(64), unique=True, nullable=False)
+    create_time = Column(TIMESTAMP, server_default=text("CURRENT_TIMESTAMP"))
+
+
 class UserInfo(Base):
     __tablename__ = "user_info"
 
@@ -17,6 +26,10 @@ class UserInfo(Base):
     algo = Column(String(16), default="md5", comment="密码算法: md5(旧)/bcrypt")
     phone = Column(String(16), default="")
     email = Column(String(64), default="")
+    department_id = Column(Integer, nullable=False, default=1, server_default=text("1"),
+                           comment="所属部门，新注册用户进默认部门(1)")
+    role = Column(String(16), nullable=False, default="member", server_default="member",
+                  comment="member 普通成员 / supervisor 主管")
     create_time = Column(TIMESTAMP, server_default=text("CURRENT_TIMESTAMP"))
 
 
@@ -41,10 +54,13 @@ class UserFileList(Base):
     file_name = Column(String(128))
     shared_status = Column(Integer, default=0)
     pv = Column(Integer, default=0)
+    department_id = Column(Integer, nullable=False, default=1, server_default=text("1"),
+                           comment="文件所属部门（=上传者部门）")
     create_time = Column(TIMESTAMP, server_default=text("CURRENT_TIMESTAMP"))
 
 
 class ShareFileList(Base):
+    """共享列表 —— 部门内共享：唯一性为 (department_id, md5, file_name)"""
     __tablename__ = "share_file_list"
 
     id = Column(Integer, primary_key=True, autoincrement=True)
@@ -52,9 +68,11 @@ class ShareFileList(Base):
     md5 = Column(String(256), nullable=False)
     file_name = Column(String(128))
     pv = Column(Integer, default=0)
+    department_id = Column(Integer, nullable=False, default=1, server_default=text("1"),
+                           comment="共享所在部门")
     create_time = Column(TIMESTAMP, server_default=text("CURRENT_TIMESTAMP"))
     __table_args__ = (
-        UniqueConstraint("md5", "file_name", name="uq_share_md5_filename"),
+        UniqueConstraint("department_id", "md5", "file_name", name="uq_share_dept_md5_filename"),
     )
 
 
