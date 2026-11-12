@@ -27,6 +27,7 @@ from app.models import (
 )
 from app.redis_client import redis
 from app.faiss_service import mark_dirty
+from app.share_stats import bump_public_count, plaza_add, plaza_remove
 from app.minio_client import client as minio_client, BUCKET, presign_from_db_url
 
 
@@ -459,9 +460,11 @@ async def tool_delete_file(username: str, **kwargs) -> dict:
                 return {"success": False, "message": f"文件 '{identifier}' 不存在"}
 
             ufl, fi = row
+            fileid = f"{ufl.md5}{ufl.file_name}"
+            was_shared = ufl.shared_status == 1
 
             # 清理分享记录（Redis 部分推迟到 commit 之后）
-            if ufl.shared_status == 1:
+            if was_shared:
                 await db.execute(
                     sql_delete(ShareFileList).where(
                         ShareFileList.user == username,
@@ -469,14 +472,8 @@ async def tool_delete_file(username: str, **kwargs) -> dict:
                         ShareFileList.file_name == ufl.file_name,
                     )
                 )
-                # 公共分享计数 -1（与 share.py _del_file 对齐，修正历史漂移）
-                result = await db.execute(
-                    select(UserFileCount).where(UserFileCount.user == "FILE_PUBLIC_COUNT")
-                )
-                ufc_pub = result.scalar()
-                if ufc_pub and ufc_pub.count > 0:
-                    ufc_pub.count -= 1
-                fileid = f"{ufl.md5}{ufl.file_name}"
+                # 部门公共分享计数 -1（与 share.py _del_file 同一部门化助手）
+                await bump_public_count(db, ufl.department_id, -1)
 
             # 删除 AI 记录
             await db.execute(
@@ -513,11 +510,10 @@ async def tool_delete_file(username: str, **kwargs) -> dict:
     except Exception as exc:
         return {"error": f"delete failed: {exc}"}
 
-    # 提交成功后的收尾：Redis 清理 + MinIO 对象删除
-    if fileid:
+    # 提交成功后的收尾：Redis 清理（部门化 key）+ MinIO 对象删除
+    if fileid and was_shared:
         try:
-            await redis.zrem("FILE_PUBLIC_ZSET", fileid)
-            await redis.hdel("FILE_NAME_HASH", fileid)
+            await plaza_remove(ufl.department_id, fileid)
         except Exception:
             pass
     if object_to_remove:
@@ -565,10 +561,12 @@ async def tool_share_file(username: str, **kwargs) -> dict:
                 return {"success": False, "message": f"文件 '{ufl.file_name}' 已分享过"}
 
             fileid = f"{ufl.md5}{ufl.file_name}"
+            dept_id = ufl.department_id
 
-            # 检查是否被他人分享
+            # 检查是否被本部门他人分享（共享语义按部门隔离）
             dup = await db.execute(
                 select(ShareFileList).where(
+                    ShareFileList.department_id == dept_id,
                     ShareFileList.md5 == ufl.md5,
                     ShareFileList.file_name == ufl.file_name,
                 ).limit(1)
@@ -577,26 +575,21 @@ async def tool_share_file(username: str, **kwargs) -> dict:
                 return {"success": False, "message": f"文件 '{ufl.file_name}' 已被分享"}
 
             ufl.shared_status = 1
-            db.add(ShareFileList(user=username, md5=ufl.md5, file_name=ufl.file_name, pv=0))
+            db.add(ShareFileList(
+                user=username, md5=ufl.md5, file_name=ufl.file_name, pv=0,
+                department_id=dept_id,
+            ))
 
-            # 公共计数 +1
-            result = await db.execute(
-                select(UserFileCount).where(UserFileCount.user == "FILE_PUBLIC_COUNT")
-            )
-            ufc = result.scalar()
-            if ufc:
-                ufc.count += 1
-            else:
-                db.add(UserFileCount(user="FILE_PUBLIC_COUNT", count=1))
+            # 部门公共计数 +1
+            await bump_public_count(db, dept_id, 1)
 
             await db.commit()
     except Exception as exc:
         return {"error": f"share failed: {exc}"}
 
-    # Redis 更新（非关键，失败不影响）
+    # Redis 更新（部门化 key，非关键，失败不影响）
     try:
-        await redis.zadd("FILE_PUBLIC_ZSET", {fileid: 0})
-        await redis.hset("FILE_NAME_HASH", fileid, ufl.file_name)
+        await plaza_add(dept_id, fileid, ufl.file_name)
     except Exception:
         pass
 

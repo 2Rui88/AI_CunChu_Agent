@@ -6,7 +6,7 @@ from pydantic import BaseModel, Field
 from sqlalchemy import select
 from sqlalchemy.exc import IntegrityError
 from app.database import Session
-from app.models import UserInfo
+from app.models import UserInfo, Department
 from app.redis_client import redis
 
 router = APIRouter(prefix="/api", tags=["auth"])
@@ -170,4 +170,18 @@ async def login(body: LoginRequest, request: Request):
         await redis.setex(f"token:{user.user_name}", 86400, token)
         # 登录成功即清除该用户名的失败计数，避免正常频繁登录被限流误伤
         await redis.delete(f"rl:login-user:{body.user}")
-        return {"code": 0, "token": token}
+
+        # 部门权限隔离：前端按角色渲染菜单（主管可见"部门文件"）、展示部门归属
+        dept_name = ""
+        dept = (await db.execute(
+            select(Department).where(Department.id == (user.department_id or 1))
+        )).scalar()
+        if dept:
+            dept_name = dept.name
+        return {
+            "code": 0,
+            "token": token,
+            "role": user.role or "member",
+            "department": dept_name,
+            "department_id": user.department_id or 1,
+        }

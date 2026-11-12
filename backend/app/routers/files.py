@@ -7,7 +7,7 @@ from sqlalchemy.exc import IntegrityError
 from app.database import Session
 from app.models import FileInfo, UserFileList, UserFileCount, UserFileAiDesc
 from app.dependencies import check_token
-from app.file_ops import attach_file_to_user
+from app.file_ops import attach_file_to_user, get_user_department
 from app.minio_client import client, BUCKET, ensure_bucket, presign_from_db_url
 
 router = APIRouter(prefix="/api", tags=["files"])
@@ -55,7 +55,8 @@ async def md5_check(body: dict):
             return {"code": 5}
 
         existing.count += 1
-        db.add(UserFileList(user=user, md5=md5, file_name=filename))
+        dept_id = await get_user_department(db, user)
+        db.add(UserFileList(user=user, md5=md5, file_name=filename, department_id=dept_id))
         # 秒传同样计入用户文件数（与上传/删除路径对齐，否则计数漂移）
         result = await db.execute(
             select(UserFileCount).where(UserFileCount.user == user)
@@ -147,7 +148,8 @@ async def upload(
                 count=1,
             ))
 
-        db.add(UserFileList(user=user, md5=md5, file_name=file.filename))
+        dept_id = await get_user_department(db, user)
+        db.add(UserFileList(user=user, md5=md5, file_name=file.filename, department_id=dept_id))
 
         result = await db.execute(
             select(UserFileCount).where(UserFileCount.user == user)

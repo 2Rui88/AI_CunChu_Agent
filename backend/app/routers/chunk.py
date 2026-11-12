@@ -316,7 +316,9 @@ async def chunk_merge(body: dict):
             shutil.rmtree(chunk_dir, ignore_errors=True)
             return {"code": 5}
 
-        db.add(UserFileList(user=user, md5=md5_val, file_name=filename))
+        from app.file_ops import get_user_department
+        dept_id = await get_user_department(db, user)
+        db.add(UserFileList(user=user, md5=md5_val, file_name=filename, department_id=dept_id))
 
         # 更新用户文件计数
         result = await db.execute(
