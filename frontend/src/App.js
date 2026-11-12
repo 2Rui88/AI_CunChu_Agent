@@ -10,6 +10,8 @@ import FileList from './pages/FileList';
 import SharedFiles from './pages/SharedFiles';
 import TopDownloads from './pages/TopDownloads';
 import VectorDocs from './pages/VectorDocs';
+import EvalCenter from './pages/EvalCenter';
+import DeptFiles from './pages/DeptFiles';
 import { AuthProvider, useAuth } from './contexts/AuthContext';
 
 const { Content } = Layout;
@@ -38,9 +40,11 @@ const PAGE_META = {
   '/': { title: '首页', desc: '与 AI 助手对话：描述内容即可搜文件，还能统计、分享、删除' },
   '/files': { title: '文件管理', desc: '上传、下载、分享普通文件，大文件自动分片续传' },
   '/images': { title: '图片库', desc: '图片上传与图床分享，AI 自动生成图片描述' },
-  '/shared': { title: '共享广场', desc: '其他用户分享的文件，可转存到自己的空间' },
-  '/top-downloads': { title: '下载排行', desc: '全站共享文件下载量 TOP 10' },
+  '/shared': { title: '共享广场', desc: '本部门成员分享的文件，可转存到自己的空间' },
+  '/top-downloads': { title: '下载排行', desc: '本部门共享文件下载量 TOP 10' },
+  '/dept': { title: '部门文件', desc: '主管查看本部门全部成员的文件（含私有），可删除任意成员的文件' },
   '/vector-docs': { title: '向量化文档', desc: '只读查看已建立语义索引的文档、切分与向量化结果，便于校验' },
+  '/eval': { title: 'RAG 评估', desc: '用固定数据集评估语义检索质量：recall / MRR / F1，逐题明细定位召回与排序问题' },
 };
 
 const PrivateRoute = ({ children }) => {
@@ -66,7 +70,9 @@ function MainLayout() {
               <Route path="/images" element={<PrivateRoute><ImageList /></PrivateRoute>} />
               <Route path="/shared" element={<PrivateRoute><SharedFiles /></PrivateRoute>} />
               <Route path="/top-downloads" element={<PrivateRoute><TopDownloads /></PrivateRoute>} />
+              <Route path="/dept" element={<PrivateRoute><DeptFiles /></PrivateRoute>} />
               <Route path="/vector-docs" element={<PrivateRoute><VectorDocs /></PrivateRoute>} />
+              <Route path="/eval" element={<PrivateRoute><EvalCenter /></PrivateRoute>} />
               <Route path="*" element={<Navigate to="/" replace />} />
             </Routes>
           </div>

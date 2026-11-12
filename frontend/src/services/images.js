@@ -227,9 +227,13 @@ export const pvSharedFile = async (file, user) => {
   return data;
 };
 
-/** 共享广场列表 */
-export const fetchSharedFiles = async () => {
-  const data = await post(`${BASE}${E.SHARE_FILES}?cmd=normal`, { cmd: 'normal' });
+/** 共享广场列表（部门内共享，需登录） */
+export const fetchSharedFiles = async (user) => {
+  const data = await post(`${BASE}${E.SHARE_FILES}?cmd=normal`, {
+    user: user.username,
+    token: user.token,
+    cmd: 'normal',
+  });
   if (data.code !== 0) throw new Error(data.msg || '获取共享列表失败');
   return data.files || [];
 };
@@ -246,9 +250,26 @@ export const saveSharedFile = async (file, user) => {
   if (data.code !== 0) throw new Error(data.msg || '转存失败');
 };
 
-/** 下载排行 */
-export const fetchTopDownloads = async () => {
-  const data = await post(`${BASE}${E.SHARE_FILES}?cmd=pvdesc`, { cmd: 'pvdesc' });
+/** 下载排行（部门内，需登录） */
+export const fetchTopDownloads = async (user) => {
+  const data = await post(`${BASE}${E.SHARE_FILES}?cmd=pvdesc`, {
+    user: user.username,
+    token: user.token,
+    cmd: 'pvdesc',
+  });
   if (data.code !== 0) throw new Error(data.msg || '获取下载排行失败');
   return data.files || [];
+};
+
+/** 删除部门内成员的文件（主管专用：dealfile cmd=del + owner） */
+export const deleteDeptFile = async (file, user) => {
+  const data = await post(`${BASE}${E.DEAL_FILE}?cmd=del`, {
+    user: user.username,
+    token: user.token,
+    md5: file.md5,
+    filename: file.file_name,
+    owner: file.user,
+  });
+  if (data.code === 6) throw new Error(data.msg || '无权操作他人的文件');
+  if (data.code !== 0) throw new Error(data.msg || '删除失败');
 };

@@ -3,6 +3,7 @@ import { Card, Button, List, Spin, Empty, Typography } from 'antd';
 import { TrophyOutlined, ReloadOutlined, DownloadOutlined, FireOutlined } from '@ant-design/icons';
 import styled from '@emotion/styled';
 import { fetchTopDownloads } from '../services/images';
+import { useAuth } from '../contexts/AuthContext';
 
 const { Text } = Typography;
 
@@ -86,11 +87,12 @@ const MedalMeta = [
 export default function TopDownloads() {
   const [files, setFiles] = useState([]);
   const [loading, setLoading] = useState(false);
+  const { user } = useAuth();
 
   const load = async () => {
     setLoading(true);
     try {
-      setFiles(await fetchTopDownloads());
+      setFiles(await fetchTopDownloads(user));
     } catch {
       setFiles([]);
     } finally {
@@ -112,7 +114,7 @@ export default function TopDownloads() {
           <TrophyOutlined style={{ color: '#f59e0b', marginRight: 8 }} />
           下载排行榜
           <Text type="secondary" style={{ fontSize: 13, fontWeight: 400, marginLeft: 10 }}>
-            按全站下载量排序的共享文件
+            按本部门下载量排序的共享文件
           </Text>
         </span>
       )}

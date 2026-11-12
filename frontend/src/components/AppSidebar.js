@@ -1,5 +1,5 @@
 import React from 'react';
-import { Layout, Menu, Avatar, Tooltip } from 'antd';
+import { Layout, Menu, Tooltip } from 'antd';
 import {
   HomeOutlined,
   PictureOutlined,
@@ -9,10 +9,13 @@ import {
   LogoutOutlined,
   CloudUploadOutlined,
   ApartmentOutlined,
+  ExperimentOutlined,
+  TeamOutlined,
 } from '@ant-design/icons';
 import styled from '@emotion/styled';
 import { useNavigate, useLocation } from 'react-router-dom';
 import { useAuth } from '../contexts/AuthContext';
+import UserAvatar from './UserAvatar';
 
 const { Sider } = Layout;
 
@@ -88,19 +91,25 @@ const UserInfo = styled.div`
   }
 `;
 
+// roles: 可见角色限定（不填=全员可见）——部门文件仅主管可见
 const MENU_ITEMS = [
   { key: '/', icon: <HomeOutlined />, label: '首页' },
   { key: '/files', icon: <FolderOpenOutlined />, label: '文件管理' },
   { key: '/images', icon: <PictureOutlined />, label: '图片库' },
   { key: '/shared', icon: <ShareAltOutlined />, label: '共享广场' },
   { key: '/top-downloads', icon: <TrophyOutlined />, label: '下载排行' },
+  { key: '/dept', icon: <TeamOutlined />, label: '部门文件', roles: ['supervisor'] },
   { key: '/vector-docs', icon: <ApartmentOutlined />, label: '向量化文档' },
+  { key: '/eval', icon: <ExperimentOutlined />, label: 'RAG 评估' },
 ];
+
+const ROLE_TEXT = { supervisor: '主管', member: '成员' };
 
 export default function AppSidebar() {
   const { user, logout } = useAuth();
   const navigate = useNavigate();
   const location = useLocation();
+  const items = MENU_ITEMS.filter((it) => !it.roles || it.roles.includes(user?.role));
 
   return (
     <Sider
@@ -126,22 +135,19 @@ export default function AppSidebar() {
           <Menu
             mode="inline"
             selectedKeys={[location.pathname]}
-            items={MENU_ITEMS}
+            items={items}
             onClick={({ key }) => navigate(key)}
             style={{ borderInlineEnd: 'none', background: 'transparent' }}
           />
         </MenuWrap>
 
         <UserBox>
-          <Avatar
-            size={34}
-            style={{ backgroundColor: '#2563eb', flex: 'none', fontWeight: 600 }}
-          >
-            {(user?.username || '?').slice(0, 1).toUpperCase()}
-          </Avatar>
+          <UserAvatar name={user?.username} size={34} />
           <UserInfo>
             <div className="name">{user?.username}</div>
-            <div className="status">● 已登录</div>
+            <div className="status">
+              ● {[user?.department, ROLE_TEXT[user?.role] || '成员'].filter(Boolean).join(' · ')}
+            </div>
           </UserInfo>
           <Tooltip title="退出登录">
             <LogoutOutlined

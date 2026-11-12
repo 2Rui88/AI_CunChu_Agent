@@ -17,7 +17,7 @@ const extractValidationMsg = (data) => {
   return `${fieldNames[field] || field || '输入'}格式不正确`;
 };
 
-/** 用户登录，成功返回 token */
+/** 用户登录，成功返回完整响应（token + role/department 部门权限信息） */
 export const loginUser = async (username, pwd) => {
   const resp = await fetch(`${BASE}${API_CONFIG.ENDPOINTS.LOGIN}`, {
     method: 'POST',
@@ -29,7 +29,7 @@ export const loginUser = async (username, pwd) => {
   if (data.code !== 0 || !data.token) {
     throw new Error(resp.status === 422 ? (extractValidationMsg(data) || '输入格式不正确') : '用户名或密码错误');
   }
-  return data.token;
+  return data;
 };
 
 /** 用户注册 */

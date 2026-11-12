@@ -17,8 +17,9 @@ const loadStoredUser = () => {
 export const AuthProvider = ({ children }) => {
   const [user, setUser] = useState(loadStoredUser);
 
-  const login = useCallback((username, token) => {
-    const u = { username, token };
+  // profile: { role, department } —— 部门权限隔离：角色决定菜单可见性（主管可见"部门文件"）
+  const login = useCallback((username, token, profile = {}) => {
+    const u = { username, token, role: profile.role || 'member', department: profile.department || '' };
     localStorage.setItem(STORAGE_KEY, JSON.stringify(u));
     // 清理旧版"用户自填 API Key"在本地的残留（密钥已改为服务端统一配置）
     Object.keys(localStorage)

@@ -9,6 +9,7 @@ export const API_CONFIG = {
     DEAL_FILE: '/api/dealfile',
     DEAL_SHARE_FILE: '/api/dealsharefile',
     SHARE_FILES: '/api/sharefiles',
+    DEPT_FILES: '/api/dept/files',
     CHUNK_INIT: '/api/chunk_init',
     CHUNK_UPLOAD: '/api/chunk_upload',
     CHUNK_MERGE: '/api/chunk_merge',
@@ -16,6 +17,15 @@ export const API_CONFIG = {
     AGENT: '/api/agent',
     VECTOR_DOCS: '/api/vector/docs',
     VECTOR_CHUNKS: '/api/vector/chunks',
+    EVAL_DATASET_UPLOAD: '/api/eval/dataset/upload',
+    EVAL_DATASET_LIST: '/api/eval/dataset/list',
+    EVAL_DATASET_ITEMS: '/api/eval/dataset/items',
+    EVAL_DATASET_DELETE: '/api/eval/dataset/delete',
+    EVAL_RUN_START: '/api/eval/run/start',
+    EVAL_RUN_STEP: '/api/eval/run/step',
+    EVAL_RUN_LIST: '/api/eval/run/list',
+    EVAL_RUN_DETAIL: '/api/eval/run/detail',
+    EVAL_RUN_DELETE: '/api/eval/run/delete',
   },
   CHUNK_SIZE: 10 * 1024 * 1024,        // 10MB per chunk
   CHUNK_THRESHOLD: 10 * 1024 * 1024,   // files > 10MB use chunked upload

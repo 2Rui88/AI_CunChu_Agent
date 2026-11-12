@@ -1,10 +1,11 @@
 import React, { useState, useEffect, useMemo } from 'react';
-import { Card, Table, Button, Tooltip, Space, message, Avatar, Input, Empty } from 'antd';
+import { Card, Table, Button, Tooltip, Space, message, Input, Empty } from 'antd';
 import { SaveOutlined, DownloadOutlined, ReloadOutlined, SearchOutlined } from '@ant-design/icons';
 import styled from '@emotion/styled';
 import { useAuth } from '../contexts/AuthContext';
 import { fetchSharedFiles, saveSharedFile, pvSharedFile } from '../services/images';
 import { getFileIcon, formatFileSize } from '../utils/format';
+import UserAvatar from '../components/UserAvatar';
 
 const WrapCard = styled(Card)`
   border-radius: 14px;
@@ -25,14 +26,6 @@ const OwnerCell = styled.div`
   gap: 8px;
 `;
 
-const AVATAR_COLORS = ['#2563eb', '#7c3aed', '#0d9488', '#d97706', '#dc2626', '#475569'];
-
-const ownerColor = (name) => {
-  let h = 0;
-  for (const ch of name || '') h = (h * 31 + ch.charCodeAt(0)) >>> 0;
-  return AVATAR_COLORS[h % AVATAR_COLORS.length];
-};
-
 export default function SharedFiles() {
   const [files, setFiles] = useState([]);
   const [loading, setLoading] = useState(false);
@@ -43,7 +36,7 @@ export default function SharedFiles() {
   const load = async () => {
     setLoading(true);
     try {
-      setFiles(await fetchSharedFiles());
+      setFiles(await fetchSharedFiles(user));
     } catch (error) {
       if (error.tokenExpired) {
         message.error('登录已过期，请重新登录');
@@ -122,9 +115,7 @@ export default function SharedFiles() {
       width: 160,
       render: (name) => (
         <OwnerCell>
-          <Avatar size={26} style={{ backgroundColor: ownerColor(name), fontSize: 12, fontWeight: 600 }}>
-            {(name || '?').slice(0, 1).toUpperCase()}
-          </Avatar>
+          <UserAvatar name={name} size={26} />
           <span>{name}</span>
         </OwnerCell>
       ),

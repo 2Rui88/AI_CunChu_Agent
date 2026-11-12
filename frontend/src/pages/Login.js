@@ -130,8 +130,8 @@ function LoginForm() {
   const onFinish = async ({ username, pwd }) => {
     setLoading(true);
     try {
-      const token = await loginUser(username, pwd);
-      login(username, token);
+      const data = await loginUser(username, pwd);
+      login(username, data.token, { role: data.role, department: data.department });
       message.success('登录成功');
       navigate('/', { replace: true });
     } catch (err) {
