@@ -87,6 +87,14 @@
 - **切块明细下钻**：可查看每个文档的切块列表（faiss_id、向量状态、降级存根标记），定位"描述生成了但向量没入库"之类的链路问题
 - **批量测试脚本** `testdocs/`：生成 8 份互不重复的 3500+ 字 docx，上传后经只读接口全量校验切片/向量化零丢失
 
+### RAG 检索评估（开发人员专用，`/eval` 页）
+
+- **数据集管理**：上传 JSONL 固定题目集（`query` 必填；`gold_files` 文件名金标或 `gold_md5s` 二选一，同名文件全部视为金标；`gold_answer` 可选仅存储）。文件名金标在上传时解析为 MD5，解析不到直接拒绝，避免静默零分
+- **同步逐题评估**：不引入任何队列/后台任务——前端循环调用 `/api/eval/run/step`，每题在单个 HTTP 请求内同步跑真实 `semantic_search` 全链路（查询规划 + 双路召回 + RRF + 重排），结果逐题落库；中断后可续跑，关掉页面已完成的题不丢失
+- **文件级指标**：`recall@1/5/10`、`MRR`、首中排名；K 档位受 top_k 约束，无金标题只执行不进均值，失败题单独计数不污染指标
+- **逐题明细可下钻**：每题保存检索 Top-K 的文件名、来源（向量路/关键词路/双路）、两路排名、RRF 分数与命中位置，用于区分"规划错、召回弱还是重排排丢"；详情抽屉支持按未命中/失败筛选
+- **运行可比较**：每次运行快照当次检索配置（模型、分数阈值、RRF K、重排触发条件），调参前后两次运行可直接对比
+
 ### AI 文件助手
 
 - **对话式交互**：SSE 实时流式输出，多轮上下文（用户消息先落库，连接中断也不丢提问）
@@ -151,6 +159,15 @@ docker exec -i tc_mysql mysql -uroot -p"$MYSQL_ROOT_PASSWORD" yuncunchu < mysql/
 docker exec -i tc_mysql mysql -uroot -p"$MYSQL_ROOT_PASSWORD" yuncunchu < mysql/migration_share_unique.sql
 docker exec -i tc_mysql mysql -uroot -p"$MYSQL_ROOT_PASSWORD" yuncunchu < mysql/migration_drop_apikey.sql
 docker exec -i tc_mysql mysql -uroot -p"$MYSQL_ROOT_PASSWORD" yuncunchu < mysql/migration_indexing_jobs.sql
+docker exec -i tc_mysql mysql -uroot -p"$MYSQL_ROOT_PASSWORD" yuncunchu < mysql/migration_eval.sql
+docker exec -i tc_mysql mysql -uroot -p"$MYSQL_ROOT_PASSWORD" yuncunchu < mysql/migration_dept.sql
+
+# 4.1 部门与角色维护（部门权限隔离，本期用 SQL）：
+#     - 新建部门：INSERT INTO departments (name) VALUES ('研发部');
+#     - 调配成员部门：UPDATE user_info SET department_id=2 WHERE user_name='alice';
+#     - 指定主管：UPDATE user_info SET role='supervisor' WHERE user_name='boss';
+#     迁移后存量用户全部在"默认部门(1)"且为 member，行为与迁移前一致；
+#     主管登录后侧边栏出现"部门文件"入口，可查看并删除本部门任意成员的文件。
 
 # 5. 访问
 open https://localhost
@@ -180,6 +197,7 @@ AI_CunChu_Agent/
 │   │   ├── faiss_service.py        # FAISS 向量索引 + 脏标记 + 文件锁
 │   │   ├── chunker.py              # 7 类文件自适应分块器
 │   │   ├── agent_tools.py          # Agent 7 个工具函数（search_files 委托 semantic_search）
+│   │   ├── evaluation/             # RAG 检索评估（开发人员专用）：models / metrics / service
 │   │   └── routers/
 │   │       ├── auth.py             # 注册/登录（bcrypt + 限流）
 │   │       ├── files.py            # 上传/秒传/文件列表
@@ -194,8 +212,8 @@ AI_CunChu_Agent/
 ├── frontend/                       # React 前端
 │   └── src/
 │       ├── components/             # AppSidebar / PageHeader / AssistantChat / ConfirmModal
-│       ├── pages/                  # Login / Home / FileList / ImageList / SharedFiles / TopDownloads / VectorDocs
-│       ├── services/               # auth.js / images.js / ai.js / agent.js / vectorDocs.js
+│       ├── pages/                  # Login / Home / FileList / ImageList / SharedFiles / TopDownloads / VectorDocs / EvalCenter
+│       ├── services/               # auth.js / images.js / ai.js / agent.js / vectorDocs.js / eval.js
 │       └── config/index.js         # API 端点配置
 ├── docker/
 │   ├── docker-compose.yaml         # 5 容器编排（前端经多阶段构建内置入 Nginx 镜像）
@@ -252,6 +270,11 @@ tc_nginx         :443/80 Nginx 反向代理（只指向 tc_backend）
 | `/api/agent/conversations/delete` | POST | 软删除会话 |
 | `/api/indexing/status` | POST | 向量化任务状态查询（前端轮询进度） |
 | `/api/indexing/stats` | POST | 队列全局聚合统计（pending/running/failed、最老 pending 年龄、活跃消费者数；监控用） |
+| `/api/eval/dataset/upload` | POST | 上传评估数据集（JSONL：query + gold_files/gold_md5s/gold_answer） |
+| `/api/eval/dataset/list` / `items` / `delete` | POST | 数据集列表 / 题目明细 / 删除（连同运行记录） |
+| `/api/eval/run/start` | POST | 创建评估运行（快照检索配置，不执行） |
+| `/api/eval/run/step` | POST | 同步执行下一题（前端循环驱动，done=true 时返回聚合指标） |
+| `/api/eval/run/list` / `detail` / `delete` | POST | 运行历史 / 逐题详情 / 删除 |
 
 ## 配置说明
 
